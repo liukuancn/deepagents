@@ -7,7 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -174,6 +174,53 @@ class TestThreadFunctions:
             assert by_id["thread2"]["cwd"] == "/tmp/workspace"
             assert by_id["thread3"]["cwd"] is None
 
+    def test_list_threads_creates_covering_index(self, temp_db):
+        """`list_threads` creates the covering index and the plan uses it.
+
+        Regression guard for the `threads list` slowdown on large profiles: the
+        GROUP BY must be an index-only scan of `idx_dcode_threads_list`, not a
+        full scan of the blob-bearing checkpoints table.
+        """
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            asyncio.run(sessions.list_threads())
+
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            index_names = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            assert "idx_dcode_threads_list" in index_names
+
+            plan = " ".join(
+                str(row[3])
+                for row in conn.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT thread_id, "
+                    "MAX(json_extract(metadata, '$.updated_at')) u, "
+                    "MAX(checkpoint_id), "
+                    "MAX(json_extract(metadata, '$.agent_name')), "
+                    "MAX(json_extract(metadata, '$.git_branch')), "
+                    "MAX(json_extract(metadata, '$.cwd')) "
+                    "FROM checkpoints GROUP BY thread_id ORDER BY u DESC LIMIT 20"
+                )
+            )
+            # Index-only scan of the covering index, not the PK autoindex (which
+            # would drag the checkpoint state blobs through I/O).
+            assert "idx_dcode_threads_list" in plan
+            assert "sqlite_autoindex_checkpoints_1" not in plan
+        finally:
+            conn.close()
+
+    def test_list_threads_index_creation_is_idempotent(self, temp_db):
+        """Repeated `list_threads` calls succeed once the index already exists."""
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            first = asyncio.run(sessions.list_threads())
+            second = asyncio.run(sessions.list_threads())
+        assert len(first) == len(second) == 3
+
     def test_list_threads_filter_by_agent(self, temp_db):
         """List filters by agent name."""
         with patch.object(sessions, "get_db_path", return_value=temp_db):
@@ -198,6 +245,23 @@ class TestThreadFunctions:
         with patch.object(sessions, "get_db_path", return_value=temp_db):
             tid = asyncio.run(sessions.get_most_recent(agent_name="agent2"))
             assert tid == "thread2"
+
+    def test_get_most_recent_excludes_thread(self, temp_db):
+        """Get most recent skips the excluded thread."""
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            tid = asyncio.run(sessions.get_most_recent(exclude_thread_id="thread3"))
+            assert tid == "thread2"
+
+    def test_get_most_recent_excludes_thread_with_agent_filter(self, temp_db):
+        """Thread exclusion composes with the agent filter."""
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            tid = asyncio.run(
+                sessions.get_most_recent(
+                    agent_name="agent1",
+                    exclude_thread_id="thread3",
+                )
+            )
+            assert tid == "thread1"
 
     def test_get_most_recent_empty(self, tmp_path):
         """Get most recent returns None when empty."""
@@ -287,18 +351,66 @@ class TestThreadFunctions:
             cwd = asyncio.run(sessions.get_thread_cwd("thread-empty"))
             assert cwd is None
 
-    def test_delete_thread(self, temp_db):
+    def test_delete_thread(self, temp_db, monkeypatch, tmp_path):
         """Delete thread removes thread."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         with patch.object(sessions, "get_db_path", return_value=temp_db):
             result = asyncio.run(sessions.delete_thread("thread1"))
             assert result is True
             assert asyncio.run(sessions.thread_exists("thread1")) is False
 
-    def test_delete_thread_not_found(self, temp_db):
+    def test_delete_thread_not_found(self, temp_db, monkeypatch, tmp_path):
         """Delete thread returns False for non-existing thread."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         with patch.object(sessions, "get_db_path", return_value=temp_db):
             result = asyncio.run(sessions.delete_thread("nonexistent"))
             assert result is False
+
+    def test_delete_thread_cleans_offloaded_history(
+        self, temp_db, monkeypatch, tmp_path
+    ):
+        """Deleting a thread removes its offloaded conversation history."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive_dir = tmp_path / ".deepagents" / "conversation_history"
+        archive_dir.mkdir(parents=True)
+        archive = archive_dir / "thread1.md"
+        archive.write_text("history")
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            result = asyncio.run(sessions.delete_thread("thread1"))
+            assert result is True
+        assert not archive.exists()
+
+    def test_delete_thread_succeeds_when_history_cleanup_fails(
+        self, temp_db, monkeypatch, tmp_path
+    ):
+        """Checkpoint deletion drives the result; history cleanup is best-effort."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        # `delete_thread` imports the helper from `offload` at call time, so
+        # patching it there simulates a failed (but swallowed) cleanup.
+        from deepagents_code import offload
+
+        monkeypatch.setattr(
+            offload, "delete_offloaded_history", MagicMock(return_value=False)
+        )
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            result = asyncio.run(sessions.delete_thread("thread1"))
+        assert result is True
+
+    def test_delete_thread_removes_orphan_archive_without_checkpoints(
+        self, temp_db, monkeypatch, tmp_path
+    ):
+        """A thread with no checkpoints still has its orphaned archive cleaned."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive_dir = tmp_path / ".deepagents" / "conversation_history"
+        archive_dir.mkdir(parents=True)
+        archive = archive_dir / "orphan-thread.md"
+        archive.write_text("history")
+        with patch.object(sessions, "get_db_path", return_value=temp_db):
+            result = asyncio.run(sessions.delete_thread("orphan-thread"))
+        # No checkpoint rows existed, so the thread is reported "not found"...
+        assert result is False
+        # ...but its stranded archive is removed regardless.
+        assert not archive.exists()
 
 
 class TestGetCheckpointer:
@@ -2711,6 +2823,225 @@ class TestLoadMessageCountsFromWritesBatch:
         # The good write still counts; the corrupt one is skipped.
         assert results == {"t1": 1}
 
+    async def test_large_append_history_counts_correctly(self) -> None:
+        """A long append-only history counts correctly via the one-pass fold.
+
+        Correctness-at-scale check for the `threads list` speedup. Note this
+        does not guard against a perf regression on its own: the old O(n^2)
+        fold returns the same count (just slowly), so a revert to the quadratic
+        path would still pass. Wall-clock assertions are too flaky for CI; a
+        codspeed benchmark would be the real regression guard.
+        """
+        serde = JsonPlusSerializer()
+
+        import aiosqlite
+
+        n = 4000
+        async with aiosqlite.connect(":memory:") as conn:
+            await conn.execute(
+                "CREATE TABLE writes "
+                "(thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT, "
+                "task_id TEXT, idx INTEGER, channel TEXT, type TEXT, value BLOB)"
+            )
+            rows = []
+            for i in range(n):
+                type_str, blob = serde.dumps_typed(
+                    [{"type": "human", "content": "x", "id": f"m{i}"}]
+                )
+                rows.append(("t1", f"cp_{i:06d}", "task1", type_str, blob))
+            await conn.executemany(
+                "INSERT INTO writes VALUES (?, '', ?, ?, 0, 'messages', ?, ?)",
+                rows,
+            )
+            await conn.commit()
+
+            results = await sessions._load_message_counts_from_writes_batch(  # pyright: ignore[reportPrivateUsage]
+                conn, ["t1"], serde
+            )
+
+        assert results == {"t1": n}
+
+
+class TestCountMessagesFromDeltas:
+    """Tests for the delta-folding message counter and its exact fallback."""
+
+    def test_fast_path_dedups_repeated_ids(self) -> None:
+        """Repeated IDs across deltas collapse to one message (fast path)."""
+        from langchain_core.messages import AIMessage
+
+        deltas = [
+            [AIMessage(content="draft", id="a1")],
+            [AIMessage(content="final", id="a1")],
+        ]
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+
+    def test_remove_all_then_append_resets(self) -> None:
+        """`REMOVE_ALL_MESSAGES` clears the buffer before later appends."""
+        from langchain_core.messages import HumanMessage, RemoveMessage
+        from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+        deltas = [
+            [HumanMessage(content="a", id="h1")],
+            [HumanMessage(content="b", id="h2")],
+            [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                HumanMessage(content="fresh", id="h9"),
+            ],
+        ]
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+
+    def test_overwrite_resets_buffer(self) -> None:
+        """An `Overwrite` delta replaces the accumulated buffer."""
+        from langchain_core.messages import HumanMessage
+        from langgraph.types import Overwrite
+
+        deltas = [
+            [HumanMessage(content="a", id="h1")],
+            [HumanMessage(content="b", id="h2")],
+            Overwrite(value=[HumanMessage(content="fresh", id="h9")]),
+        ]
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+
+    def test_duplicate_id_within_one_delta_counts_once(self) -> None:
+        """Two messages sharing an ID in one delta collapse to a single count.
+
+        Pins the case excluded from the property test: batch and sequential
+        `add_messages` may order/identify differently, but the *count* the
+        counter reports is the same (both dedup by ID), so the fast path is
+        safe here and needs no exact-fold routing.
+        """
+        from langchain_core.messages import AIMessage
+
+        deltas = [
+            [AIMessage(content="draft", id="d1"), AIMessage(content="final", id="d1")]
+        ]
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+        assert sessions._count_messages_from_deltas(  # pyright: ignore[reportPrivateUsage]
+            deltas
+        ) == sessions._incremental_message_count(deltas)  # pyright: ignore[reportPrivateUsage]
+
+    def test_specific_remove_matches_incremental_fold(self) -> None:
+        """A delete-by-ID routes through the exact fold and matches it."""
+        from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+
+        deltas = [
+            [HumanMessage(content="a", id="h1"), AIMessage(content="b", id="a1")],
+            [RemoveMessage(id="a1")],
+        ]
+        assert sessions._count_messages_from_deltas(  # pyright: ignore[reportPrivateUsage]
+            deltas
+        ) == sessions._incremental_message_count(deltas)  # pyright: ignore[reportPrivateUsage]
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+
+    def test_internal_messages_do_not_inflate_count(self) -> None:
+        """Metadata-marked local and remote notices are not user-visible rows."""
+        from langchain_core.messages import HumanMessage
+
+        deltas = [
+            [HumanMessage(content="real", id="h1")],
+            [
+                HumanMessage(
+                    content="hidden",
+                    id="h2",
+                    additional_kwargs={"lc_source": "goal_state"},
+                )
+            ],
+            [
+                {
+                    "type": "human",
+                    "content": "hidden remote",
+                    "id": "h3",
+                    "additional_kwargs": {"lc_source": "goal_state"},
+                }
+            ],
+            [
+                HumanMessage(
+                    content="hidden continuation",
+                    id="h4",
+                    additional_kwargs={"lc_source": "goal_control"},
+                )
+            ],
+            [
+                HumanMessage(
+                    content="hidden summary",
+                    id="h5",
+                    additional_kwargs={"lc_source": "summarization"},
+                )
+            ],
+        ]
+
+        assert sessions._count_messages_from_deltas(deltas) == 1  # pyright: ignore[reportPrivateUsage]
+
+    def test_fast_and_exact_agree_on_realistic_histories(self) -> None:
+        """Fast path and exact fold agree on append/clear/overwrite histories.
+
+        Covers the realistic shapes the counter sees (unique-ID appends,
+        streaming updates that reuse an ID, compaction clears, and snapshot
+        overwrites). Excludes duplicate-ID-within-one-delta, whose batch-vs-
+        sequential *ordering/identity* equivalence we haven't characterized;
+        the counts still match there (see
+        `test_duplicate_id_within_one_delta_counts_once`).
+        """
+        import random
+
+        from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+        from langgraph.graph.message import REMOVE_ALL_MESSAGES
+        from langgraph.types import Overwrite
+
+        rng = random.Random(20240117)
+        for _ in range(500):
+            deltas: list[object] = []
+            next_id = 0
+            for _ in range(rng.randint(0, 25)):
+                roll = rng.random()
+                if roll < 0.6:
+                    next_id += 1
+                    cls = rng.choice([HumanMessage, AIMessage])
+                    deltas.append([cls(content="x", id=f"m{next_id}")])
+                elif roll < 0.75 and next_id:
+                    # Streaming update: reuse a recent ID.
+                    deltas.append(
+                        [AIMessage(content="y", id=f"m{rng.randint(1, next_id)}")]
+                    )
+                elif roll < 0.85:
+                    deltas.append([RemoveMessage(id=REMOVE_ALL_MESSAGES)])
+                else:
+                    count = rng.randint(0, 3)
+                    deltas.append(
+                        Overwrite(
+                            value=[
+                                HumanMessage(content="o", id=f"ov{j}")
+                                for j in range(count)
+                            ]
+                        )
+                    )
+            fast = sessions._count_messages_from_deltas(deltas)  # pyright: ignore[reportPrivateUsage]
+            exact = sessions._incremental_message_count(deltas)  # pyright: ignore[reportPrivateUsage]
+            assert fast == exact, deltas
+
+
+def test_inlined_checkpoint_count_excludes_internal_messages() -> None:
+    """Checkpoint summaries count only user-visible messages."""
+    from langchain_core.messages import HumanMessage
+
+    summary = sessions._summarize_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        {
+            "channel_values": {
+                "messages": [
+                    HumanMessage(content="real", id="h1"),
+                    HumanMessage(
+                        content="hidden",
+                        id="h2",
+                        additional_kwargs={"lc_source": "goal_state"},
+                    ),
+                ]
+            }
+        }
+    )
+
+    assert summary.message_count == 1
+    assert summary.initial_prompt == "real"
+
 
 class TestInitialPromptFromMessages:
     """Tests for the message-list parser used by the writes-table reader."""
@@ -2762,6 +3093,45 @@ class TestInitialPromptFromMessages:
             ]
         )
         assert result == "real prompt"
+
+    def test_skips_metadata_marked_local_and_remote_messages(self) -> None:
+        """`lc_source` prevents hidden notices from becoming thread titles."""
+        from langchain_core.messages import HumanMessage
+
+        result = sessions._initial_prompt_from_messages(  # pyright: ignore[reportPrivateUsage]
+            [
+                HumanMessage(
+                    content="hidden local",
+                    additional_kwargs={"lc_source": "goal_state"},
+                ),
+                {
+                    "type": "human",
+                    "content": "hidden remote",
+                    "additional_kwargs": {"lc_source": "goal_state"},
+                },
+                HumanMessage(
+                    content="hidden continuation",
+                    additional_kwargs={"lc_source": "goal_control"},
+                ),
+                {"role": "user", "content": "real prompt"},
+            ]
+        )
+
+        assert result == "real prompt"
+
+    def test_unknown_source_can_be_the_initial_prompt(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        result = sessions._initial_prompt_from_messages(  # pyright: ignore[reportPrivateUsage]
+            [
+                HumanMessage(
+                    content="connector prompt",
+                    additional_kwargs={"lc_source": "slack"},
+                )
+            ]
+        )
+
+        assert result == "connector prompt"
 
     def test_returns_none_when_only_system_message(self) -> None:
         """A lone `[SYSTEM]` message yields no displayable prompt."""

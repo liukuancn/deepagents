@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     import argparse
 
     from deepagents_code.config import TracingStatus
+    from deepagents_code.extras_info import VersionReport
 
 logger = logging.getLogger(__name__)
 
@@ -59,22 +60,26 @@ def _platform_tag() -> str:
     return f"{platform.system()}-{platform.machine()}".lower()
 
 
-def _sdk_version() -> tuple[str, bool]:
-    """Return the installed `deepagents` SDK version and whether it resolved.
+def _sdk_diagnostic(report: VersionReport) -> tuple[str, bool]:
+    """Return the doctor SDK version value and whether it is healthy.
 
-    Maps the shared `resolve_sdk_version` outcome onto doctor's display: a
-    genuinely missing package reads as `not installed`, an unexpected lookup
-    failure as `unknown`, and only a resolved version is marked healthy.
+    A genuinely missing package reads as `not installed`, an unexpected lookup
+    failure as `unknown`, and a resolved version carries its editable/drift/
+    mismatch annotation. A dependency-requirement mismatch or invalid editable
+    source marker is unhealthy; drift between valid source and installed
+    metadata alone is informational, since it is normal while editing SDK source.
     """
-    from deepagents_code.extras_info import resolve_sdk_version
+    from deepagents_code.extras_info import format_sdk_version_annotation
 
-    sdk_version, status = resolve_sdk_version()
-    if status == "resolved":
-        # `sdk_version` is a real string when the status is "resolved".
-        return sdk_version or "unknown", True
-    if status == "not_installed":
+    sdk = report.sdk
+    if sdk.status == "not_installed":
         return "not installed", False
-    return "unknown", False
+    if sdk.status != "resolved":
+        return "unknown", False
+    value = f"{report.display_sdk_version}{format_sdk_version_annotation(report)}"
+    return value, not (
+        report.sdk_requirement_mismatch or report.sdk_source_version_invalid
+    )
 
 
 def _build_commit() -> str | None:
@@ -157,9 +162,21 @@ def _collect_diagnostics() -> DiagnosticSection:
         _get_editable_install_path,
         _is_editable_install,
     )
+    from deepagents_code.extras_info import (
+        collect_version_report,
+        format_cli_version_annotation,
+    )
     from deepagents_code.update_check import detect_install_method
 
-    sdk_version, sdk_ok = _sdk_version()
+    report = collect_version_report()
+    sdk_version, sdk_ok = _sdk_diagnostic(report)
+
+    # Source/metadata drift is informational (normal while editing source), so
+    # it annotates the value without flagging the CLI item unhealthy. Reuse the
+    # shared annotation helper so the phrasing stays in lockstep with
+    # `--version`/`/version` (editable status is shown via `Install method`).
+    cli_value = f"{__version__}{format_cli_version_annotation(report.cli)}"
+
     editable = _is_editable_install()
     if editable:
         method = "editable"
@@ -171,7 +188,7 @@ def _collect_diagnostics() -> DiagnosticSection:
     return DiagnosticSection(
         title="Diagnostics",
         items=[
-            DiagnosticItem("deepagents-code", __version__),
+            DiagnosticItem("deepagents-code", cli_value),
             DiagnosticItem("deepagents (SDK)", sdk_version, ok=sdk_ok),
             DiagnosticItem("Commit hash", _commit_hash(path)),
             DiagnosticItem("Python", platform.python_version()),
@@ -274,6 +291,75 @@ def _sanitize_endpoint(endpoint: str) -> str:
     return f"{parsed.scheme}://{netloc}"
 
 
+_LANGSMITH_GATEWAY_HOST = "smith.langchain.com"
+"""Host identifying LangSmith's managed (SaaS) tracing gateway.
+
+Traces sent to an endpoint whose host is `smith.langchain.com` (or a subdomain
+of it) route through the managed gateway; any other host is a self-hosted or
+dev/staging target. `app.py` keeps the same constant for its model-gateway
+key-mismatch check, but matches a raw-URL substring; this module matches the
+parsed hostname exactly or by subdomain suffix so lookalike hosts such as
+`smith.langchain.com.evil.example` are not treated as the gateway.
+"""
+
+
+def _endpoint_gateway_state(endpoint: str) -> str:
+    """Classify a single tracing endpoint as gateway, non-gateway, or unknown.
+
+    Args:
+        endpoint: A configured tracing endpoint URL.
+
+    Returns:
+        `"yes"` when the endpoint's host is the LangSmith managed gateway (an
+            exact host or a subdomain), `"no"` for any other resolvable host,
+            and `"unknown"` when the endpoint cannot be parsed into a host — so
+            a typo'd or malformed URL is never silently reported as `"no"`.
+    """
+    try:
+        host = urlsplit(endpoint.strip()).hostname or ""
+    except ValueError:
+        # urlsplit raises on bracket-malformed IPv6 (e.g. `http://[::1`); a
+        # diagnostic must degrade to "unknown" rather than crash `dcode doctor`.
+        return "unknown"
+    if not host:
+        return "unknown"
+    if host == _LANGSMITH_GATEWAY_HOST or host.endswith(f".{_LANGSMITH_GATEWAY_HOST}"):
+        return "yes"
+    return "no"
+
+
+def _tracing_gateway_state(status: TracingStatus) -> str:
+    """Report whether all trace ingestion targets are the managed gateway.
+
+    Considers both the primary endpoint and any replica ingestion URLs
+    (`LANGSMITH_RUNS_ENDPOINTS`), since a self-hosted replica means traces leave
+    for a custom target even when the primary endpoint is unset. With no target
+    configured, tracing falls back to the LangSmith SDK default
+    (`https://api.smith.langchain.com`), which is the managed gateway.
+
+    Args:
+        status: The resolved tracing status.
+
+    Returns:
+        `"yes"` when every configured target is the managed gateway (or none is
+            configured, i.e. the SDK default), `"no"` when any target is a
+            self-hosted or dev/staging host, and `"unknown"` when a target
+            cannot be parsed and none is a definite non-gateway host.
+    """
+    states = [
+        _endpoint_gateway_state(target)
+        for target in (status.endpoint, *status.runs_endpoints)
+        if target
+    ]
+    if not states:
+        return "yes"
+    if "no" in states:
+        return "no"
+    if "unknown" in states:
+        return "unknown"
+    return "yes"
+
+
 def _format_tracing_project(status: TracingStatus) -> str:
     """Render the tracing project, marking the unconfigured default.
 
@@ -297,7 +383,11 @@ def _collect_tracing() -> DiagnosticSection:
     value is never read or printed. The `Credentials` item is flagged as a
     problem only when tracing is enabled without a key and without a custom
     endpoint, mirroring the runtime's orphaned-tracing guard (a keyless
-    self-hosted endpoint is a valid, healthy setup).
+    self-hosted endpoint is a valid, healthy setup). When tracing is enabled, a
+    `Gateway` item reports whether traces route through LangSmith's managed
+    (SaaS) gateway (`yes`), a custom self-hosted/dev/staging endpoint (`no`), or
+    an endpoint that could not be parsed (`unknown`), accounting for both the
+    primary endpoint and any replica ingestion targets.
 
     Returns:
         The `Tracing` section.
@@ -323,6 +413,8 @@ def _collect_tracing() -> DiagnosticSection:
     ]
     if status.endpoint:
         items.append(DiagnosticItem("Endpoint", _sanitize_endpoint(status.endpoint)))
+    if status.enabled:
+        items.append(DiagnosticItem("Gateway", _tracing_gateway_state(status)))
     if status.replica_project:
         items.append(DiagnosticItem("Replica project", status.replica_project))
     return DiagnosticSection(title="Tracing", items=items)
@@ -430,7 +522,7 @@ def _render_text(sections: list[DiagnosticSection]) -> None:
         console.print()
 
     console.print(
-        "  Tip: Run `dcode config show` or `dcode config get <key>` "
+        "  Tip: Run `dcode config` or `dcode config get <key>` "
         "to drill into config details.",
         style=theme.MUTED,
         highlight=False,

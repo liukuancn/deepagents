@@ -35,7 +35,11 @@ class CLIContextSchema:
 
     model_params: dict[str, Any] = field(default_factory=dict)
 
-    effective_model: str | None = None
+    profile_overrides: dict[str, Any] = field(default_factory=dict)
+
+    model_context_limit: int | None = None
+
+    approval_mode: str = "manual"
 
     auto_approve: bool = False
 
@@ -43,7 +47,15 @@ class CLIContextSchema:
 
     thread_id: str | None = None
 
-    blocked_goal_retry_context: str | None = None
+    turn_id: str | None = None
+
+    offload_tool_call_id: str | None = None
+
+    hooks_snapshot_id: str | None = None
+
+    hooks_server_events: list[str] = field(default_factory=list)
+
+    prompt_id: str | None = None
 
 
 class CLIContext(TypedDict, total=False):
@@ -63,25 +75,17 @@ class CLIContext(TypedDict, total=False):
     """Invocation params (e.g. `temperature`, `max_tokens`) to merge
     into `model_settings`."""
 
-    effective_model: str | None
-    """Resolved `provider:model` spec actually in use for this invocation.
+    profile_overrides: dict[str, Any]
+    """Model profile metadata supplied by `--profile-override`."""
 
-    Unlike `model` (a swap *instruction* that is `None` when the base model is
-    used), this carries the model in effect — whether from a `/model` override
-    or the startup default — so `ResumeStateMiddleware` can record it to
-    checkpoint state for restore on resume. `None` when no usable spec is
-    resolved yet (e.g. credentials not configured), in which case nothing is
-    recorded rather than a malformed spec.
-    """
+    model_context_limit: int | None
+    """Effective context-window limit for profile-aware middleware."""
+
+    approval_mode: str
+    """`manual`, classifier-backed `auto`, or unrestricted `yolo`."""
 
     auto_approve: bool
-    """Whether gated tool calls should skip the human-approval interrupt.
-
-    Sourced from the client session (not graph state) so the model cannot
-    self-approve by writing state. The `interrupt_on` `when` predicate reads
-    this to suppress interrupts at the source when "approve always" is on,
-    avoiding the interrupt-then-auto-resolve round-trip.
-    """
+    """Compatibility snapshot for clients predating the typed mode field."""
 
     approval_mode_key: str | None
     """Store key for the live approval-mode control record.
@@ -100,10 +104,29 @@ class CLIContext(TypedDict, total=False):
     session-affinity headers.
     """
 
-    blocked_goal_retry_context: str | None
-    """One-turn model context for retrying a previously blocked goal.
+    turn_id: str | None
+    """Current user-turn ID for binding trusted interactive responses."""
 
-    This is intentionally carried in runtime context instead of the user
-    message so it is not parsed as a file mention or checkpointed as human
-    input.
+    offload_tool_call_id: str | None
+    """The sole tool-call ID authorized during a server-driven `/offload` run.
+
+    This is set by the client, not graph state, so model-generated calls cannot
+    grant themselves permission to execute during the hidden compaction turn.
     """
+
+    hooks_snapshot_id: str | None
+    """Canonical Hooks v2 configuration hash for this session.
+
+    Server-owned lifecycle middleware includes this id on interrupt requests so
+    the client can reject mismatched resumes.
+    """
+
+    hooks_server_events: list[str]
+    """Server-owned HookEvent names that have configured handlers.
+
+    Middleware only interrupts for events listed here, avoiding a round-trip
+    when the session snapshot has no matching handlers.
+    """
+
+    prompt_id: str | None
+    """Optional per-turn prompt id projected into hook context."""

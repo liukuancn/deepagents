@@ -79,6 +79,24 @@ COMMANDS: tuple[SlashCommand, ...] = (
         hidden_keywords="switch profile persona",
     ),
     SlashCommand(
+        name="/auto",
+        description="Switch to Auto approval mode",
+        bypass_tier=BypassTier.SIDE_EFFECT_FREE,
+        hidden_keywords="approval mode classifier automatic auto-approve shift+tab",
+    ),
+    SlashCommand(
+        name="/manual",
+        description="Switch to Manual approval mode",
+        bypass_tier=BypassTier.SIDE_EFFECT_FREE,
+        hidden_keywords="approval mode approve prompt review shift+tab",
+    ),
+    SlashCommand(
+        name="/yolo",
+        description="Switch to YOLO approval mode (no review)",
+        bypass_tier=BypassTier.SIDE_EFFECT_FREE,
+        hidden_keywords="approval mode unrestricted auto-approve dangerous shift+tab",
+    ),
+    SlashCommand(
         name="/auth",
         description="Connect and manage provider and service credentials",
         bypass_tier=BypassTier.IMMEDIATE_UI,
@@ -106,15 +124,28 @@ COMMANDS: tuple[SlashCommand, ...] = (
     ),
     SlashCommand(
         name="/goal",
-        description="Set a persistent objective by drafting acceptance criteria",
+        description="Set and manage a persistent objective with acceptance criteria",
         bypass_tier=BypassTier.QUEUED,
-        hidden_keywords="objective criteria acceptance rubric",
-        argument_hint="[<objective>|show|clear]",
+        hidden_keywords=(
+            "objective criteria acceptance amend pause resume rubric grader grading "
+            "model iterations"
+        ),
+        argument_hint=(
+            "[<objective>|amend <feedback>|pause|resume|show|clear|model|"
+            "max-iterations]"
+        ),
     ),
     SlashCommand(
         name="/editor",
         description="Open prompt in an external editor ($EDITOR)",
         bypass_tier=BypassTier.QUEUED,
+    ),
+    SlashCommand(
+        name="/effort",
+        description="Set reasoning effort for the current model",
+        bypass_tier=BypassTier.QUEUED,
+        hidden_keywords="reasoning thinking level",
+        argument_hint="[<level>|clear]",
     ),
     SlashCommand(
         name="/mcp",
@@ -124,19 +155,25 @@ COMMANDS: tuple[SlashCommand, ...] = (
         argument_hint="[login <server> | reconnect]",
     ),
     SlashCommand(
+        name="/plugins",
+        description="Manage plugins",
+        bypass_tier=BypassTier.IMMEDIATE_UI,
+        hidden_keywords="plugin marketplace skills mcp enable disable install",
+    ),
+    SlashCommand(
         name="/model",
         description="Switch models or edit model settings",
         bypass_tier=BypassTier.IMMEDIATE_UI,
     ),
     SlashCommand(
         name="/notifications",
-        description="Configure startup warnings",
+        description="Configure warning notifications",
         bypass_tier=BypassTier.IMMEDIATE_UI,
-        hidden_keywords="warnings alerts suppress",
+        hidden_keywords="warnings alerts suppress startup yolo",
     ),
     SlashCommand(
         name="/offload",
-        description="Offload older messages to free context",
+        description="Summarize and offload older messages to free context",
         bypass_tier=BypassTier.QUEUED,
         hidden_keywords="compact",
         aliases=("/compact",),
@@ -146,6 +183,14 @@ COMMANDS: tuple[SlashCommand, ...] = (
         description="Save useful context to memory or skills",
         bypass_tier=BypassTier.QUEUED,
         argument_hint="[context]",
+    ),
+    # Keep after `/remember` so equal-score prefix ties resolve as
+    # `re` → `/remember`, `rel` → `/reload`.
+    SlashCommand(
+        name="/reload",
+        description="Reload environment and config",
+        bypass_tier=BypassTier.QUEUED,
+        hidden_keywords="refresh plugin plugins marketplace",
     ),
     SlashCommand(  # Static alias; not auto-generated from skill discovery
         name="/skill-creator",
@@ -157,7 +202,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
         name="/threads",
         description="Browse and resume past threads",
         bypass_tier=BypassTier.IMMEDIATE_UI,
-        hidden_keywords="continue history sessions",
+        hidden_keywords="continue history sessions resume back previous",
+        argument_hint="[-r [ID]]",
     ),
     SlashCommand(
         name="/trace",
@@ -171,24 +217,24 @@ COMMANDS: tuple[SlashCommand, ...] = (
         hidden_keywords="cost",
     ),
     SlashCommand(
-        name="/reload",
-        description="Reload environment and config",
+        name="/tools",
+        description="List the tools available to the agent",
         bypass_tier=BypassTier.QUEUED,
-        hidden_keywords="refresh",
+        hidden_keywords="mcp functions capabilities builtin built-in",
     ),
     SlashCommand(
         name="/rubric",
         description="Set explicit acceptance criteria for rubric grading",
         bypass_tier=BypassTier.IMMEDIATE_UI,
-        hidden_keywords="criteria acceptance grader grading evaluation",
-        argument_hint="[set|next|file|show|clear|model]",
+        hidden_keywords="criteria acceptance grader grading evaluation iterations",
+        argument_hint="[set|next|file|show|clear|model|max-iterations]",
         aliases=("/criteria",),
     ),
     SlashCommand(
         name="/restart",
         description="Restart the agent server",
         bypass_tier=BypassTier.ALWAYS,
-        hidden_keywords="respawn server",
+        hidden_keywords="respawn server reconnect connect",
     ),
     SlashCommand(
         name="/theme",
@@ -301,7 +347,7 @@ SIDE_EFFECT_FREE: frozenset[str] = _build_bypass_set(BypassTier.SIDE_EFFECT_FREE
 QUEUE_BOUND: frozenset[str] = _build_bypass_set(BypassTier.QUEUED)
 """Commands that must wait in the queue when the app is busy."""
 
-HIDDEN_COMMANDS: frozenset[str] = frozenset({"/debug-error"})
+HIDDEN_COMMANDS: frozenset[str] = frozenset({"/debug", "/debug-error"})
 """Power-user commands kept out of autocomplete and help."""
 
 STARTUP_RECOVERY_COMMANDS: frozenset[str] = frozenset(
@@ -341,7 +387,11 @@ class CommandEntry(NamedTuple):
     """A single autocomplete entry for the slash-command controller."""
 
     name: str
-    """Canonical command name (e.g. `/quit`)."""
+    """Canonical command name (e.g. `/quit`).
+
+    This is the machine name: it is matched against user input and inserted
+    into the prompt on completion.
+    """
 
     description: str
     """Short user-facing description."""
@@ -352,9 +402,30 @@ class CommandEntry(NamedTuple):
     argument_hint: str
     """Placeholder text shown when the command accepts arguments (e.g. `[context]`)."""
 
+    display_name: str = ""
+    """Label shown in the autocomplete popup instead of `name`, when set.
 
-SLASH_COMMANDS: list[CommandEntry] = [cmd.to_entry() for cmd in COMMANDS]
-"""Autocomplete entries derived from `COMMANDS` for `SlashCommandController`."""
+    Lets a command present a short, friendly label (e.g. `/skill:review`) while
+    still matching and inserting its full canonical `name`
+    (e.g. `/skill:my-plugin:review`). Falls back to `name` when empty.
+    """
+
+    def label(self) -> str:
+        """Return the popup label, preferring `display_name` over `name`.
+
+        Returns:
+            The user-facing label for the autocomplete popup.
+        """
+        return self.display_name or self.name
+
+
+def get_slash_commands() -> list[CommandEntry]:
+    """Return autocomplete entries for slash commands.
+
+    Returns:
+        Autocomplete entries derived from `COMMANDS`.
+    """
+    return [command.to_entry() for command in COMMANDS]
 
 
 def parse_skill_command(command: str) -> tuple[str, str]:
@@ -389,13 +460,49 @@ appear as `/skill:model`).
 """
 
 
+def _skill_command_entry(skill: ExtendedSkillMetadata) -> CommandEntry:
+    """Build a single autocomplete entry for a discovered skill.
+
+    Plugin skills carry a namespaced machine name (`plugin:sub:skill`). Their
+    popup label is shortened to the terminal skill segment and their
+    description is tagged with the plugin id, so the picker stays readable
+    while completion still inserts the full canonical `/skill:` name.
+
+    Returns:
+        The autocomplete entry for the skill.
+    """
+    machine_name = f"/skill:{skill['name']}"
+    is_plugin = skill.get("source") == "plugin"
+
+    if is_plugin:
+        terminal = skill["name"].rsplit(":", 1)[-1]
+        display_name = f"/skill:{terminal}"
+        plugin_id = skill["name"].split(":", 1)[0]
+        description = f"({plugin_id}) {skill['description']}"
+    else:
+        display_name = ""
+        description = skill["description"]
+
+    return CommandEntry(
+        name=machine_name,
+        description=description,
+        # Match on the full namespaced name and the terminal segment so both
+        # `myplugin:review` and `review` surface the plugin skill.
+        hidden_keywords=skill["name"].replace(":", " "),
+        argument_hint="",
+        display_name=display_name,
+    )
+
+
 def build_skill_commands(
     skills: list[ExtendedSkillMetadata],
 ) -> list[CommandEntry]:
     """Build autocomplete entries for discovered skills.
 
     Each skill becomes a `/skill:<name>` entry with its description
-    and the skill name as a hidden keyword for fuzzy matching.
+    and the skill name as a hidden keyword for fuzzy matching. Plugin skills
+    keep their namespaced machine name for matching/insertion but present a
+    short, source-tagged label in the popup.
 
     Skills that already have a dedicated slash command in `COMMANDS`
     (e.g., `remember` → `/remember`) are excluded to avoid duplicate
@@ -408,12 +515,7 @@ def build_skill_commands(
         List of `CommandEntry` instances.
     """
     return [
-        CommandEntry(
-            name=f"/skill:{skill['name']}",
-            description=skill["description"],
-            hidden_keywords=skill["name"],
-            argument_hint="",
-        )
+        _skill_command_entry(skill)
         for skill in skills
         if skill["name"] not in _STATIC_SKILL_ALIASES
     ]

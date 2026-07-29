@@ -1997,7 +1997,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2012,7 +2012,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2028,7 +2028,7 @@ class TestThemeSelectorScreen:
     async def test_escape_restores_original_theme(self) -> None:
         from textual.app import App
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         results: list[str | None] = []
 
@@ -2051,7 +2051,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.theme import Theme as TextualTheme
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         class SyncApp(App[None]):
             def __init__(self) -> None:
@@ -2095,7 +2095,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.theme import Theme as TextualTheme
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         class SyncApp(App[None]):
             def __init__(self) -> None:
@@ -2143,7 +2143,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.theme import Theme as TextualTheme
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         class SyncApp(App[None]):
             def __init__(self) -> None:
@@ -2181,7 +2181,7 @@ class TestThemeSelectorScreen:
             await pilot.pause()
 
             with caplog.at_level(
-                logging.WARNING, logger="deepagents_code.widgets.theme_selector"
+                logging.WARNING, logger="deepagents_code.tui.widgets.theme_selector"
             ):
                 await pilot.press("down")
                 await pilot.pause()
@@ -2194,7 +2194,7 @@ class TestThemeSelectorScreen:
     async def test_enter_selects_theme(self) -> None:
         from textual.app import App
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         results: list[str | None] = []
 
@@ -2222,14 +2222,15 @@ class TestThemeSelectorScreen:
         Leaves the picker open so the user can confirm and keep browsing.
         `[ui].theme` is intentionally untouched — pressing `t` is "save for
         this terminal", not "save as my global default". The shared
-        `_CONFIG_WRITE_LOCK` prevents racing the parent's Enter writer.
+        shared `model_config._config_write_lock` prevents racing the parent's
+        Enter writer.
         """
         import tomllib
 
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2271,7 +2272,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2309,7 +2310,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2341,7 +2342,7 @@ class TestThemeSelectorScreen:
         """Without `TERM_PROGRAM`, `t` warns instead of writing a bad mapping."""
         from textual.app import App
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2372,7 +2373,7 @@ class TestThemeSelectorScreen:
         """A whitespace-only `TERM_PROGRAM` is treated as unset."""
         from textual.app import App
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2409,7 +2410,7 @@ class TestThemeSelectorScreen:
         from textual.widgets import OptionList
 
         from deepagents_code.app import _ConfigWriteResult
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2469,7 +2470,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2526,7 +2527,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
 
         from deepagents_code.app import _ConfigWriteResult
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2563,7 +2564,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2592,7 +2593,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2616,7 +2617,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2645,7 +2646,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         app = App()
         async with app.run_test() as pilot:
@@ -2708,7 +2709,7 @@ class TestThemeSelectorScreen:
         from textual.theme import Theme as TextualTheme
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2766,7 +2767,7 @@ class TestThemeSelectorScreen:
         """Without a `t` press, Esc still reverts the previewed theme."""
         from textual.app import App
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2798,7 +2799,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2851,7 +2852,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2896,7 +2897,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2936,7 +2937,7 @@ class TestThemeSelectorScreen:
         from textual.app import App
         from textual.widgets import OptionList
 
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -2992,7 +2993,7 @@ class TestThemeSelectorScreen:
         from textual.widgets import OptionList
 
         from deepagents_code.app import _ConfigWriteResult
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
@@ -3054,7 +3055,7 @@ class TestThemeSelectorScreen:
         from textual.widgets import OptionList
 
         from deepagents_code.app import _ConfigWriteResult
-        from deepagents_code.widgets.theme_selector import ThemeSelectorScreen
+        from deepagents_code.tui.widgets.theme_selector import ThemeSelectorScreen
 
         config = tmp_path / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)

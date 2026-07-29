@@ -77,13 +77,166 @@ class TestCollectSections:
         """The Diagnostics section reports the running CLI version."""
         from deepagents_code._version import __version__
 
-        diagnostics = collect_sections()[0]
+        # Isolate the SDK requirement check so the workspace pin cannot inject a
+        # mismatch annotation into the CLI value under test.
+        with patch(
+            "deepagents_code.extras_info.sdk_requirement_from_cli",
+            return_value=None,
+        ):
+            diagnostics = collect_sections()[0]
         labels = {item.label: item.value for item in diagnostics.items}
         assert labels["deepagents-code"] == __version__
         assert "Commit hash" in labels
         assert labels["Commit hash"]
         assert "Platform" in labels
         assert "Install method" in labels
+
+
+class TestDiagnosticsVersionReport:
+    """Tests for how the Diagnostics section renders version-report facts."""
+
+    def _diagnostics(self, report: object) -> dict[str, DiagnosticItem]:
+        from deepagents_code.doctor import _collect_diagnostics
+
+        with (
+            patch(
+                "deepagents_code.extras_info.collect_version_report",
+                return_value=report,
+            ),
+            patch("deepagents_code.doctor._commit_hash", return_value="abc1234"),
+        ):
+            section = _collect_diagnostics()
+        return {item.label: item for item in section.items}
+
+    def test_sdk_requirement_mismatch_is_unhealthy(self) -> None:
+        """An unsatisfied declared SDK requirement makes the SDK item unhealthy."""
+        from packaging.requirements import Requirement
+
+        from deepagents_code._version import __version__
+        from deepagents_code.extras_info import DistributionVersion, VersionReport
+
+        report = VersionReport(
+            cli=DistributionVersion(
+                "deepagents-code", __version__, __version__, True, "~/src", "resolved"
+            ),
+            sdk=DistributionVersion(
+                "deepagents", "0.6.12", "0.6.12", True, "~/src/sdk", "resolved"
+            ),
+            sdk_requirement=Requirement("deepagents>=0.7,<0.8"),
+            sdk_requirement_satisfied=False,
+        )
+        items = self._diagnostics(report)
+        sdk = items["deepagents (SDK)"]
+        assert sdk.ok is False
+        assert "required by deepagents-code: <0.8,>=0.7 — mismatch" in sdk.value
+
+    def test_newer_exact_sdk_pin_is_informational_for_editable_sdk(self) -> None:
+        """A newer exact dcode pin is healthy for an editable main SDK checkout."""
+        from packaging.requirements import Requirement
+
+        from deepagents_code._version import __version__
+        from deepagents_code.extras_info import DistributionVersion, VersionReport
+
+        report = VersionReport(
+            cli=DistributionVersion(
+                "deepagents-code",
+                __version__,
+                __version__,
+                True,
+                "/repo/libs/code",
+                "resolved",
+            ),
+            sdk=DistributionVersion(
+                "deepagents",
+                "0.6.12",
+                "0.6.12",
+                True,
+                "/repo/libs/deepagents",
+                "resolved",
+            ),
+            sdk_requirement=Requirement("deepagents==0.7.0a8"),
+            sdk_requirement_satisfied=True,
+        )
+        items = self._diagnostics(report)
+        sdk = items["deepagents (SDK)"]
+        assert sdk.ok is True
+        assert sdk.value == ("0.7.0a8+editable (workspace HEAD; source marker: 0.6.12)")
+
+    def test_source_metadata_drift_is_informational(self) -> None:
+        """Source/metadata drift annotates the values but stays healthy."""
+        from packaging.requirements import Requirement
+
+        from deepagents_code._version import __version__
+        from deepagents_code.extras_info import DistributionVersion, VersionReport
+
+        report = VersionReport(
+            cli=DistributionVersion(
+                "deepagents-code", __version__, "0.1.40", True, "~/src", "resolved"
+            ),
+            sdk=DistributionVersion(
+                "deepagents", "0.6.13", "0.6.12", True, "~/src/sdk", "resolved"
+            ),
+            sdk_requirement=Requirement("deepagents>=0.6"),
+            sdk_requirement_satisfied=True,
+        )
+        items = self._diagnostics(report)
+        cli = items["deepagents-code"]
+        sdk = items["deepagents (SDK)"]
+        assert cli.ok is True
+        assert cli.value == f"{__version__} (installed metadata: 0.1.40)"
+        assert sdk.ok is True
+        assert "installed metadata: 0.6.12" in sdk.value
+
+    def test_invalid_editable_sdk_source_version_is_unhealthy(self) -> None:
+        """Stale metadata cannot make a broken editable SDK look healthy."""
+        from packaging.requirements import Requirement
+
+        from deepagents_code._version import __version__
+        from deepagents_code.extras_info import DistributionVersion, VersionReport
+
+        report = VersionReport(
+            cli=DistributionVersion(
+                "deepagents-code",
+                __version__,
+                __version__,
+                True,
+                "/repo/libs/code",
+                "resolved",
+            ),
+            sdk=DistributionVersion(
+                "deepagents",
+                None,
+                "0.6.12",
+                True,
+                "/repo/libs/deepagents",
+                "resolved",
+            ),
+            sdk_requirement=Requirement("deepagents==0.7.0a8"),
+            sdk_requirement_satisfied=False,
+        )
+        sdk = self._diagnostics(report)["deepagents (SDK)"]
+        assert sdk.ok is False
+        assert "invalid source marker: unavailable" in sdk.value
+
+    def test_sdk_not_installed_is_unhealthy(self) -> None:
+        """A missing SDK is reported as not installed and unhealthy."""
+        from deepagents_code._version import __version__
+        from deepagents_code.extras_info import DistributionVersion, VersionReport
+
+        report = VersionReport(
+            cli=DistributionVersion(
+                "deepagents-code", __version__, __version__, False, None, "resolved"
+            ),
+            sdk=DistributionVersion(
+                "deepagents", None, None, False, None, "not_installed"
+            ),
+            sdk_requirement=None,
+            sdk_requirement_satisfied=None,
+        )
+        items = self._diagnostics(report)
+        sdk = items["deepagents (SDK)"]
+        assert sdk.ok is False
+        assert sdk.value == "not installed"
 
 
 class TestCollectTracing:
@@ -103,7 +256,9 @@ class TestCollectTracing:
             "replica_project": None,
         }
         defaults.update(kwargs)
-        status = TracingStatus(**defaults)  # type: ignore[arg-type]
+        # `defaults` is intentionally heterogeneous (`dict[str, object]`), so the
+        # unpack can't be statically matched to each field's type.
+        status = TracingStatus(**defaults)  # ty: ignore[invalid-argument-type]
         with patch("deepagents_code.config.get_tracing_status", return_value=status):
             return _collect_tracing()
 
@@ -184,6 +339,72 @@ class TestCollectTracing:
         assert "secret" not in labels["Endpoint"]
         assert "api_key" not in labels["Endpoint"]
 
+    def test_gateway_yes_for_default_endpoint(self) -> None:
+        """No custom endpoint means the SDK default (managed gateway) is used."""
+        section = self._section(enabled=True, has_credentials=True, endpoint=None)
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "yes"
+
+    def test_gateway_yes_for_langsmith_host(self) -> None:
+        """A `smith.langchain.com` endpoint routes through the managed gateway."""
+        section = self._section(
+            enabled=True,
+            has_credentials=True,
+            endpoint="https://api.smith.langchain.com",
+        )
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "yes"
+        # A configured endpoint surfaces both items; they must not interfere.
+        assert "Endpoint" in labels
+
+    def test_gateway_no_for_custom_endpoint(self) -> None:
+        """A self-hosted/dev endpoint is not the LangSmith managed gateway."""
+        section = self._section(
+            enabled=True,
+            has_credentials=False,
+            endpoint="http://localhost:1984",
+        )
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "no"
+
+    def test_gateway_unknown_for_unparseable_endpoint(self) -> None:
+        """An endpoint with no parseable host reports `unknown`, never `no`."""
+        section = self._section(
+            enabled=True,
+            has_credentials=True,
+            endpoint="not a url",
+        )
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "unknown"
+
+    def test_gateway_no_when_replica_endpoint_is_self_hosted(self) -> None:
+        """A self-hosted replica target counts even with no primary endpoint."""
+        section = self._section(
+            enabled=True,
+            has_credentials=True,
+            endpoint=None,
+            runs_endpoints=("http://localhost:1984",),
+        )
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "no"
+
+    def test_gateway_yes_when_replica_endpoint_is_gateway(self) -> None:
+        """Replica targets on the managed gateway keep the report `yes`."""
+        section = self._section(
+            enabled=True,
+            has_credentials=True,
+            endpoint=None,
+            runs_endpoints=("https://eu.api.smith.langchain.com",),
+        )
+        labels = {item.label: item.value for item in section.items}
+        assert labels["Gateway"] == "yes"
+
+    def test_gateway_absent_when_not_enabled(self) -> None:
+        """The Gateway line only appears when tracing is enabled."""
+        section = self._section(enabled=False)
+        labels = {item.label: item.value for item in section.items}
+        assert "Gateway" not in labels
+
     def test_replica_project_listed_when_set(self) -> None:
         """A configured replica project is surfaced as its own item."""
         section = self._section(
@@ -193,6 +414,58 @@ class TestCollectTracing:
         )
         labels = {item.label: item.value for item in section.items}
         assert labels["Replica project"] == "replica"
+
+
+class TestEndpointGatewayState:
+    """Tests for the single-endpoint tracing gateway-host classifier."""
+
+    def test_exact_host_is_gateway(self) -> None:
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("https://smith.langchain.com") == "yes"
+
+    def test_regional_subdomain_is_gateway(self) -> None:
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("https://eu.api.smith.langchain.com") == "yes"
+
+    def test_whitespace_padded_endpoint_is_gateway(self) -> None:
+        """A padded env value (a classic misconfiguration) still classifies."""
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("  https://smith.langchain.com  ") == "yes"
+
+    def test_self_hosted_is_not_gateway(self) -> None:
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("http://localhost:1984") == "no"
+
+    def test_suffix_lookalike_host_is_not_gateway(self) -> None:
+        """A host containing the domain as a substring is not the gateway."""
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert (
+            _endpoint_gateway_state("https://smith.langchain.com.evil.example") == "no"
+        )
+
+    def test_prefix_lookalike_host_is_not_gateway(self) -> None:
+        """The leading-dot boundary rejects a host that only shares a suffix."""
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("https://notsmith.langchain.com") == "no"
+
+    def test_unparseable_endpoint_is_unknown(self) -> None:
+        """A string with no parseable host is `unknown`, not a false `no`."""
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("not a url") == "unknown"
+        assert _endpoint_gateway_state("") == "unknown"
+
+    def test_bracket_malformed_ipv6_is_unknown(self) -> None:
+        """A `urlsplit` `ValueError` degrades to `unknown` rather than crashing."""
+        from deepagents_code.doctor import _endpoint_gateway_state
+
+        assert _endpoint_gateway_state("http://[::1") == "unknown"
 
 
 class TestCollectUpdates:
@@ -355,14 +628,21 @@ class TestRunDoctorCommand:
 
     def test_text_output_contains_sections(self) -> None:
         """Text output renders each section title and key facts."""
-        code, output = self._run_text()
+        # Isolate the SDK requirement check so a workspace where the declared
+        # `deepagents` pin intentionally leads the installed SDK does not make
+        # the section unhealthy; the mismatch path has dedicated coverage.
+        with patch(
+            "deepagents_code.extras_info.sdk_requirement_from_cli",
+            return_value=None,
+        ):
+            code, output = self._run_text()
         assert code == 0
         assert "Diagnostics" in output
         assert "Updates" in output
         assert "Tracing" in output
         assert "Configuration" in output
         assert "deepagents-code" in output
-        assert "dcode config show" in output
+        assert "dcode config" in output
         assert "dcode config get <key>" in output
         assert "dcode --version" in output
         assert "dcode -v" in output
@@ -370,7 +650,13 @@ class TestRunDoctorCommand:
     def test_json_output_envelope(self, capsys) -> None:
         """JSON output is a stable envelope with section data."""
         args = argparse.Namespace(output_format="json")
-        code = run_doctor_command(args)
+        # Isolate the SDK requirement check (see text-output test) so the
+        # envelope reports the healthy shape regardless of the workspace pin.
+        with patch(
+            "deepagents_code.extras_info.sdk_requirement_from_cli",
+            return_value=None,
+        ):
+            code = run_doctor_command(args)
         assert code == 0
 
         captured = capsys.readouterr()
@@ -452,7 +738,7 @@ class TestDoctorHelp:
         output = buf.getvalue()
         assert "dcode doctor [options]" in output
         assert "Usage:" in output
-        assert "dcode config show" in output
+        assert "dcode config" in output
         assert "dcode config get <key>" in output
         assert "dcode --version" in output
         assert "dcode -v" in output

@@ -1,21 +1,23 @@
-"""Internal chat models used by local integration tests."""
+"""Internal fake chat models for local integration tests.
+
+The tool-binding base these build on (`_fake_models._ToolBindingFakeModel`) is
+factored out into a use-neutral module so the `dcode tools list` enumeration
+path can reuse it without importing this test-named module.
+"""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field
+
+from deepagents_code._fake_models import _ToolBindingFakeModel
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
     from langchain_core.callbacks import CallbackManagerForLLMRun
-    from langchain_core.language_models import LanguageModelInput
-    from langchain_core.runnables import Runnable
-    from langchain_core.tools import BaseTool
 
 
 # Prompt markers that drive `ToolCallingIntegrationChatModel`. Each marker is the
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
 DCA_TEST_WRITE_FILE_MARKER = "DCA_TEST_WRITE_FILE="
 DCA_TEST_DELEGATE_WRITE_MARKER = "DCA_TEST_DELEGATE_WRITE="
 DCA_SUBAGENT_WRITE_FILE_MARKER = "DCA_SUBAGENT_WRITE_FILE="
+DCA_TEST_GOAL_CRITERIA_MARKER = "DCA_TEST_GOAL_CRITERIA="
 
 # Distinct file contents per write path, so a test asserting on file content can
 # prove which branch executed — in particular that subagent mode delegated through
@@ -33,13 +36,13 @@ TOP_LEVEL_WRITE_CONTENT = "auto-approved"
 SUBAGENT_WRITE_CONTENT = "auto-approved-subagent"
 
 
-class DeterministicIntegrationChatModel(GenericFakeChatModel):
+class DeterministicIntegrationChatModel(_ToolBindingFakeModel):
     """Deterministic chat model for integration tests.
 
-    This subclasses LangChain's `GenericFakeChatModel` so the implementation
-    stays aligned with the core fake-chat-model test surface, while overriding
-    generation to remain prompt-driven and restart-safe for real CLI server
-    integration tests.
+    This subclasses `_ToolBindingFakeModel` (itself a `GenericFakeChatModel`) so
+    the implementation stays aligned with the core fake-chat-model test surface,
+    while overriding generation to remain prompt-driven and restart-safe for real
+    CLI server integration tests.
 
     Why the existing `langchain_core` fakes cannot be reused here:
 
@@ -53,13 +56,15 @@ class DeterministicIntegrationChatModel(GenericFakeChatModel):
         identical output regardless of process lifecycle.
 
     2. The agent runtime calls `model.bind_tools(schemas)` during
-        initialization. None of the core fakes implement `bind_tools`, so they
-        raise `AttributeError` in any agent-loop context. This model provides a
+        initialization. A bare `GenericFakeChatModel` inherits
+        `BaseChatModel.bind_tools`, which raises `NotImplementedError` in any
+        agent-loop context. The inherited `_ToolBindingFakeModel` supplies a
         no-op passthrough.
 
     3. The app server reads `model.profile` for capability negotiation (e.g.
-        `tool_calling`, `max_input_tokens`). Core fakes have no such attribute,
-        causing `AttributeError` or silent misconfiguration at runtime.
+        `tool_calling`, `max_input_tokens`). A bare fake's `profile` is `None`,
+        causing silent misconfiguration at runtime. The inherited
+        `_ToolBindingFakeModel` supplies a minimal profile.
 
     Additionally, the compact middleware issues summarization prompts mid-
     conversation. A list-based model cannot distinguish these from normal user
@@ -68,24 +73,8 @@ class DeterministicIntegrationChatModel(GenericFakeChatModel):
     """
 
     model: str = "fake"
-    # Required by `GenericFakeChatModel`, but our override does not consume it.
-    messages: object = Field(default_factory=lambda: iter(()))
-    profile: dict[str, Any] | None = Field(
-        default_factory=lambda: {
-            "tool_calling": True,
-            "max_input_tokens": 8000,
-        }
-    )
-
-    def bind_tools(
-        self,
-        tools: Sequence[dict[str, Any] | type | Callable | BaseTool],  # noqa: ARG002
-        *,
-        tool_choice: str | None = None,  # noqa: ARG002
-        **kwargs: Any,  # noqa: ARG002
-    ) -> Runnable[LanguageModelInput, AIMessage]:
-        """Return self so the agent can bind tool schemas during tests."""
-        return self
+    # `messages`, `profile`, and the `bind_tools` passthrough are inherited from
+    # `_ToolBindingFakeModel`; this model adds only prompt-driven generation.
 
     def _generate(
         self,
@@ -314,4 +303,44 @@ class ToolCallingIntegrationChatModel(DeterministicIntegrationChatModel):
                     "call_write_file",
                 ),
             ),
+        )
+
+
+class GoalCriteriaIntegrationChatModel(DeterministicIntegrationChatModel):
+    """Exercise nested criteria generation with a repository read."""
+
+    disable_streaming: bool = True
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,  # noqa: ARG002
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,  # noqa: ARG002
+    ) -> ChatResult:
+        """Read the marked file, then return a structured goal proposal.
+
+        Returns:
+            A repository tool call followed by a `GoalProposal` tool call.
+        """
+        prompt = "\n".join(
+            text
+            for message in messages
+            if (text := self._stringify_message(message)).strip()
+        )
+        has_tool_result = any(message.type == "tool" for message in messages)
+        if DCA_TEST_GOAL_CRITERIA_MARKER in prompt and not has_tool_result:
+            path = _extract_marker_path(prompt, DCA_TEST_GOAL_CRITERIA_MARKER)
+            return _tool_call_result(
+                "read_file",
+                {"file_path": path, "limit": 20},
+                "call_goal_read",
+            )
+        return _tool_call_result(
+            "GoalProposal",
+            {
+                "objective": "verify server-side criteria generation",
+                "criteria": "- server repository context is available",
+            },
+            "call_goal_proposal",
         )

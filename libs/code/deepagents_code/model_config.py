@@ -7,6 +7,7 @@ structured way to define available models and providers.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -24,13 +25,24 @@ from urllib.parse import urlparse
 import tomli_w
 
 from deepagents_code import _env_vars, auth_store
+from deepagents_code._git import find_git_common_dir
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
+
+    from deepagents_code.json_types import JsonValue
 
 logger = logging.getLogger(__name__)
 
 _ENV_PREFIX = "DEEPAGENTS_CODE_"
+_resolved_env_var_log_lock = threading.Lock()
+_resolved_env_var_log_names: set[str] = set()
+
+
+def reset_env_resolution_log() -> None:
+    """Allow successful prefixed environment resolutions to be logged again."""
+    with _resolved_env_var_log_lock:
+        _resolved_env_var_log_names.clear()
 
 
 def resolved_env_var_name(canonical: str) -> str:
@@ -88,8 +100,14 @@ def resolve_env_var(name: str) -> str | None:
                     name,
                     prefixed,
                 )
-            if val:
-                logger.debug("Resolved %s from %s", name, prefixed)
+            if val and logger.isEnabledFor(logging.DEBUG):
+                # `resolve_env_var` is called frequently; log each successful
+                # prefixed resolution only once per generation to avoid spam.
+                with _resolved_env_var_log_lock:
+                    should_log = name not in _resolved_env_var_log_names
+                    _resolved_env_var_log_names.add(name)
+                if should_log:
+                    logger.debug("Resolved %s from %s", name, prefixed)
             return val or None
     return os.environ.get(name) or None
 
@@ -438,6 +456,13 @@ class ProviderConfig(TypedDict, total=False):
     capitalization.
     """
 
+    short_name: str
+    """Compact brand label for space-constrained UI (e.g. the `/model` Recent
+    tag), where the full `display_name` — which may carry a parenthetical
+    qualifier like `"OpenAI Codex (ChatGPT login)"` — is too long. Optional;
+    when unset, callers fall back to `display_name`.
+    """
+
     api_key_url: str
     """Provider page where users can create or manage API keys.
 
@@ -515,6 +540,16 @@ Sized to fit comfortably above the provider-grouped list in `/model` without
 pushing the rest of the catalog off-screen on a typical terminal.
 """
 
+LANGSMITH_GATEWAY_PROVIDERS: frozenset[str] = frozenset(
+    {"anthropic", "baseten", "fireworks", "google_genai", "openai"}
+)
+"""Providers whose LangChain integrations support LangSmith LLM Gateway env vars."""
+
+LANGSMITH_GATEWAY_ENV = "LANGSMITH_GATEWAY"
+LANGSMITH_GATEWAY_API_KEY_ENV = "LANGSMITH_GATEWAY_API_KEY"
+_LANGSMITH_GATEWAY_FALSE_VALUES = frozenset({"false", "0", "no"})
+
+
 PROVIDER_API_KEY_ENV: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "azure_openai": "AZURE_OPENAI_API_KEY",
@@ -528,6 +563,7 @@ PROVIDER_API_KEY_ENV: dict[str, str] = {
     "huggingface": "HUGGINGFACEHUB_API_TOKEN",
     "ibm": "WATSONX_APIKEY",
     "litellm": "LITELLM_API_KEY",
+    "meta": "MODEL_API_KEY",
     "mistralai": "MISTRAL_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -555,9 +591,18 @@ Storing a key for this service via `/auth` also enables tracing at startup
 name, so it gets special handling beyond a plain key copy.
 """
 
+TAVILY_SERVICE = "tavily"
+"""Service name for Tavily web search in `SERVICE_API_KEY_ENV`.
+
+Storing a key for this service via `/auth` gates the spawn-time `web_search`
+tool (see `server_graph._build_tools`), so a key added to a running server
+takes effect only after a respawn — the app offers that restart, and this
+constant is the single name its `/auth` handling compares against.
+"""
+
 SERVICE_API_KEY_ENV: dict[str, str] = {
     LANGSMITH_SERVICE: "LANGSMITH_API_KEY",
-    "tavily": "TAVILY_API_KEY",
+    TAVILY_SERVICE: "TAVILY_API_KEY",
 }
 """Non-model services configurable via `/auth`, mapped to their API-key env var.
 
@@ -578,6 +623,9 @@ source, model class, and request endpoint all differ. See
 
 CODEX_MODELS: frozenset[str] = frozenset(
     {
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
         "gpt-5.5",
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -605,6 +653,7 @@ RETRY_PARAM_BY_PROVIDER: dict[str, str] = {
     "google_vertexai": "max_retries",
     "groq": "max_retries",
     "litellm": "max_retries",
+    "meta": "max_retries",
     "mistralai": "max_retries",
     "openai": "max_retries",
     "openrouter": "max_retries",
@@ -650,6 +699,7 @@ PROVIDER_BASE_URL_ENV: dict[str, tuple[str, ...]] = {
     #   huggingface   the integration and huggingface_hub both read
     #                 HF_INFERENCE_ENDPOINT.
     #   ibm           ChatWatsonx reads WATSONX_URL.
+    #   meta          ChatMetaModel reads MODEL_API_BASE.
     #   mistralai     ChatMistralAI reads MISTRAL_BASE_URL.
     #   nvidia        ChatNVIDIA reads NVIDIA_BASE_URL.
     #   openai        langchain_openai reads OPENAI_API_BASE; the openai SDK
@@ -683,6 +733,7 @@ PROVIDER_BASE_URL_ENV: dict[str, tuple[str, ...]] = {
     "groq": ("GROQ_BASE_URL", "GROQ_API_BASE"),
     "huggingface": ("HF_INFERENCE_ENDPOINT",),
     "ibm": ("WATSONX_URL",),
+    "meta": ("MODEL_API_BASE",),
     "mistralai": ("MISTRAL_BASE_URL",),
     "nvidia": ("NVIDIA_BASE_URL",),
     "openai": ("OPENAI_BASE_URL", "OPENAI_API_BASE"),
@@ -742,6 +793,9 @@ OPTIONAL_AUTH_ENV: dict[str, str] = {"ollama": "OLLAMA_API_KEY"}
 PROVIDER_HOST_ENV: dict[str, str] = {"ollama": "OLLAMA_HOST"}
 """Provider-specific env vars that can point a local provider at a remote host."""
 
+PROVIDER_CUSTOM_HEADERS_ENV: dict[str, str] = {"anthropic": "ANTHROPIC_CUSTOM_HEADERS"}
+"""Provider SDK env vars that inject custom request headers (e.g. gateway auth)."""
+
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434"
 """Default endpoint assumed when no `base_url` or `OLLAMA_HOST` is configured."""
 
@@ -760,7 +814,36 @@ _builtin_providers_cache: dict[str, Any] | None = None
 _default_config_cache: ModelConfig | None = None
 _provider_profiles_cache: dict[str, dict[str, Any]] = {}
 _provider_profiles_lock = threading.Lock()
+_config_write_lock = threading.RLock()
+"""Process-wide lock serializing read-modify-write transactions on `config.toml`.
+
+Any helper that reads the file, mutates a section, and atomically replaces it
+must hold this lock for the whole transaction. The atomic rename alone only
+prevents torn writes; without a lock covering read-through-replace, two
+overlapping writers (e.g. concurrent effort-selection workers) can each read the
+same snapshot and the last `replace()` silently drops the other's change.
+
+Because the hazard is on the whole-file replace (not per-section), *every* writer
+of `config.toml` must share this one lock — a second lock guarding the same file
+would not mutually exclude, so a `[effort]` write could still clobber a `[ui]`
+write. All such helpers here hold it, and `app.py`'s theme/UI writers import and
+hold this same object rather than defining their own.
+
+It is reentrant so a caller can hold it across several of these helpers without
+self-deadlock. Cross-process races are out of scope (mirrors the existing
+helpers)."""
 _ollama_installed_models_cache: dict[str, list[str]] = {}
+_ollama_unreachable_endpoints: set[str] = set()
+"""Local endpoints (trailing slash stripped) whose daemon refused the TCP
+presence preflight.
+
+Lets `_get_ollama_installed_models` negatively-cache the empty result for a
+daemon that is definitively absent (connection refused) so it probes and logs
+"not detected" once per reload. A *reachable* daemon that merely has no models
+pulled yet -- and a daemon whose preflight is only ambiguous (a connect
+timeout, which defers to the HTTP probe) -- is still re-probed (its empty
+result is not cached), so a later `ollama pull` is discovered without
+`/reload`. Cleared by `clear_caches()`."""
 _ollama_model_profiles_cache: dict[tuple[str, str], dict[str, Any]] = {}
 _profiles_cache: Mapping[str, ModelProfileEntry] | None = None
 _profiles_override_cache: tuple[int, Mapping[str, ModelProfileEntry]] | None = None
@@ -777,6 +860,7 @@ def clear_caches() -> None:
     _default_config_cache = None
     _provider_profiles_cache.clear()
     _ollama_installed_models_cache.clear()
+    _ollama_unreachable_endpoints.clear()
     _ollama_model_profiles_cache.clear()
     _profiles_cache = None
     _profiles_override_cache = None
@@ -1392,6 +1476,14 @@ def _ollama_discovery_enabled() -> bool:
 def _get_ollama_installed_models(endpoint: str | None) -> list[str]:
     """Return cached Ollama model names for `endpoint`.
 
+    The result is cached when the daemon returns models, and also when a local
+    daemon definitively refuses the TCP presence preflight, so the two startup
+    callers (`get_available_models` and `get_model_profiles`) share a single
+    probe and a single "not detected" log line per reload. A reachable daemon
+    that reports no models -- and one whose preflight is merely ambiguous (a
+    connect timeout) -- is left uncached so a later pull can still be discovered
+    without `/reload`.
+
     Args:
         endpoint: Base URL of the Ollama daemon. When `None`, defaults to
             `OLLAMA_DEFAULT_BASE_URL`.
@@ -1404,9 +1496,78 @@ def _get_ollama_installed_models(endpoint: str | None) -> list[str]:
     if cached is not None:
         return list(cached)
     models = _fetch_ollama_installed_models(endpoint)
-    if models:
+    if models or key in _ollama_unreachable_endpoints:
         _ollama_installed_models_cache[key] = models
     return list(models)
+
+
+def _ollama_host_reachable(
+    base: str, *, timeout: float = OLLAMA_DISCOVERY_TIMEOUT_SECONDS
+) -> bool:
+    """Return whether a TCP listener appears to accept connections at `base`.
+
+    A lightweight presence preflight so Ollama discovery can skip the HTTP
+    probe entirely when no daemon is running (e.g. Ollama is not installed).
+    The check opens and immediately closes a TCP connection to the endpoint's
+    host and port. A *definitive* failure -- connection refused, DNS error, or
+    sockets blocked under `pytest-socket` -- reports "not reachable" so
+    discovery falls back gracefully (and the caller may negatively cache it). A
+    *connect timeout* is ambiguous -- a present-but-slow or still-booting daemon
+    times out just like an absent one -- so it defers to the HTTP probe
+    (reports "reachable") rather than being cached as absent. An unexpected
+    (non-`OSError`) failure is additionally logged at warning so a real bug
+    isn't misreported as absence.
+
+    Args:
+        base: Base URL of the Ollama daemon, e.g. `http://localhost:11434`.
+        timeout: Socket connection timeout in seconds.
+
+    Returns:
+        `True` when a connection is established (a daemon appears present) or
+            when presence cannot be determined -- unparseable target or a
+            connect timeout -- so the caller defers to the HTTP probe; `False`
+            when the connection is definitively refused.
+    """
+    import socket
+
+    parsed = urlparse(base)
+    host = parsed.hostname
+    if not host:
+        # Can't determine a target host; let the HTTP probe make the decision.
+        return True
+    try:
+        port = parsed.port
+    except ValueError:
+        # Malformed port (out of range / non-numeric); defer to the HTTP probe.
+        return True
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    # Expected transport failures split by how definitive they are. A refusal
+    # (`ECONNREFUSED` and friends -- an `OSError`) is a fast, certain "nothing
+    # is listening", so it reports absent and lets the caller negatively cache
+    # it. A connect *timeout* is ambiguous (present-but-slow vs. absent-and-
+    # firewalled), so it defers to the HTTP probe rather than being cached as
+    # absent and stuck until the next reload. `TimeoutError` is an `OSError`
+    # subclass, so its branch must precede the broad `OSError` one. Anything
+    # non-`OSError` is surfaced at warning so a real bug isn't misreported as
+    # "not detected"; `pytest-socket`'s `SocketBlockedError` inherits from
+    # `Exception` (not `OSError`), so the broad branch catches it. The socket
+    # is its own context manager, so `with` closes the probe connection.
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except TimeoutError:
+        return True
+    except OSError:
+        return False
+    except Exception as exc:  # noqa: BLE001  # see comment above
+        logger.warning(
+            "Ollama presence preflight raised unexpected %s for %s: %s",
+            type(exc).__name__,
+            base,
+            exc,
+        )
+        return False
 
 
 def _fetch_ollama_installed_models(
@@ -1446,6 +1607,18 @@ def _fetch_ollama_installed_models(
             base,
         )
         return []
+
+    # Presence preflight (local endpoints only -- remote hosts may be reachable
+    # only through a proxy that the HTTP probe honors but a raw socket does
+    # not). A dead/absent daemon (the common case when Ollama is not installed)
+    # refuses the connection; detecting that here lets us skip the HTTP probe
+    # and log a quiet "not detected" line instead of a misleading
+    # "discovery failed ... Connection refused" debug line.
+    if _is_local_endpoint(base) and not _ollama_host_reachable(base, timeout=timeout):
+        logger.debug("Ollama daemon not detected at %s; skipping discovery", base)
+        _ollama_unreachable_endpoints.add(base)
+        return []
+
     url = f"{base}/api/tags"
 
     headers = _ollama_discovery_headers(base, content_type=False)
@@ -1715,6 +1888,63 @@ def resolve_provider_credential(provider: str) -> str | None:
     return None
 
 
+def _resolve_gateway_configured(provider: str) -> ProviderAuthStatus | None:
+    """Return `CONFIGURED` when LangSmith Gateway can authenticate a provider.
+
+    Credential preflight normally requires each provider's native API key
+    (for example `OPENAI_API_KEY`). Users who route traffic through the
+    LangSmith LLM Gateway often set only `LANGSMITH_GATEWAY` and
+    `LANGSMITH_GATEWAY_API_KEY`. Without this fallback, model selection and
+    startup treat those models as missing credentials even though the
+    gateway-aware chat integration will authenticate the request.
+
+    Example:
+        A user enables the gateway with:
+
+            LANGSMITH_GATEWAY=true
+            LANGSMITH_GATEWAY_API_KEY=lsv2_...
+
+        and has no `OPENAI_API_KEY`. Selecting `openai:gpt-5.5` should still
+        pass preflight because OpenAI is a gateway-supported provider and
+        both gateway env vars are present.
+
+    The gateway counts only when all of the following hold:
+
+    - `provider` is in `LANGSMITH_GATEWAY_PROVIDERS` (built-in chats that
+      actually read the gateway env vars)
+    - `LANGSMITH_GATEWAY` is set and is not a disable value
+      (`false` / `0` / `no`)
+    - `LANGSMITH_GATEWAY_API_KEY` is non-empty
+
+    Callers must still skip this path for `class_path` provider overrides:
+    those construct an arbitrary class that need not consume the gateway
+    variables, so their own `api_key_env` preflight has to stand alone.
+
+    Args:
+        provider: Provider name (e.g., `"openai"`, `"anthropic"`).
+
+    Returns:
+        A `CONFIGURED` status pointing at `LANGSMITH_GATEWAY_API_KEY`, or
+        `None` when the gateway cannot authenticate this provider.
+    """
+    gateway = os.getenv(LANGSMITH_GATEWAY_ENV)
+    gateway_key = os.getenv(LANGSMITH_GATEWAY_API_KEY_ENV)
+    if (
+        provider not in LANGSMITH_GATEWAY_PROVIDERS
+        or not gateway
+        or gateway.lower() in _LANGSMITH_GATEWAY_FALSE_VALUES
+        or not gateway_key
+    ):
+        return None
+    return ProviderAuthStatus(
+        state=ProviderAuthState.CONFIGURED,
+        provider=provider,
+        env_var=LANGSMITH_GATEWAY_API_KEY_ENV,
+        source=ProviderAuthSource.ENV,
+        detail="LangSmith Gateway credentials set",
+    )
+
+
 def _resolve_configured(provider: str, env_var: str) -> ProviderAuthStatus | None:
     """Return a `CONFIGURED` status if a stored or env credential is set.
 
@@ -1848,6 +2078,15 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
             configured = _resolve_configured(provider, env_var)
             if configured:
                 return configured
+            # The gateway fallback is only valid when the built-in,
+            # gateway-aware integration will actually be constructed. A
+            # `class_path` override builds an arbitrary custom class via
+            # `_create_model_from_class` that need not consume the gateway
+            # variables, so its own `api_key_env` preflight must stand.
+            if not provider_config.get("class_path"):
+                gateway_configured = _resolve_gateway_configured(provider)
+                if gateway_configured:
+                    return gateway_configured
             return ProviderAuthStatus(
                 state=ProviderAuthState.MISSING,
                 provider=provider,
@@ -1871,6 +2110,9 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
         configured = _resolve_configured(provider, env_var)
         if configured:
             return configured
+        gateway_configured = _resolve_gateway_configured(provider)
+        if gateway_configured:
+            return gateway_configured
         if provider in IMPLICIT_AUTH_PROVIDERS:
             return ProviderAuthStatus(
                 state=ProviderAuthState.IMPLICIT,
@@ -2170,6 +2412,10 @@ def _apply_stored_base_url(provider: str, base_url: str | None) -> None:
     clears every name when `base_url` is `None` (reset to the provider
     default). See `apply_stored_credentials` for the pairing rationale.
 
+    When switching to a provider-native key (no `base_url`), also clears the
+    provider's custom-headers env var (e.g. `ANTHROPIC_CUSTOM_HEADERS`) so a
+    gateway-provisioned auth header isn't sent to the native endpoint.
+
     Args:
         provider: Provider name.
         base_url: The stored endpoint, or `None` to reset to the default.
@@ -2183,11 +2429,55 @@ def _apply_stored_base_url(provider: str, base_url: str | None) -> None:
         names.add(canonical)
     if not names:
         return
+    configured_base_url_survives = _configured_base_url_survives_env_clear(provider)
     for name in names:
         if base_url and name == canonical:
             os.environ[name] = base_url
         else:
             os.environ.pop(name, None)
+
+    # A provider SDK's custom-header env var (e.g. `ANTHROPIC_CUSTOM_HEADERS`)
+    # injects headers into every request. A gateway-provisioned environment
+    # often sets it to `X-Api-Key: <gateway-key>`, which overrides the SDK's
+    # own `api_key`-derived header. When switching to a provider-native key
+    # (no stored `base_url`), that header must also be cleared — otherwise the
+    # gateway key is sent to the native endpoint and rejected.
+    custom_headers_env = PROVIDER_CUSTOM_HEADERS_ENV.get(provider)
+    if custom_headers_env and not base_url:
+        if not configured_base_url_survives:
+            if os.environ.pop(custom_headers_env, None) is not None:
+                # Log the env var name only — never its value, which carries
+                # auth headers. Surfaces the removal for the user who set a
+                # header deliberately for the native endpoint and later wonders
+                # where it went.
+                logger.info(
+                    "Cleared %s while applying a provider-native %s key",
+                    custom_headers_env,
+                    provider,
+                )
+        elif os.environ.get(custom_headers_env) is not None:
+            # A provider base URL still routes (config or a prefixed env var),
+            # so the custom-header env is deliberately kept. Log the name only —
+            # never the value — so the retention is observable when a user later
+            # wonders why a gateway header is still in effect after applying a
+            # native key.
+            logger.debug(
+                "Kept %s: a %s base URL is still configured",
+                custom_headers_env,
+                provider,
+            )
+
+
+def _configured_base_url_survives_env_clear(provider: str) -> bool:
+    """Return whether endpoint config still routes after plain env cleanup."""
+    config = ModelConfig.load()
+    provider_cfg = config.providers.get(provider)
+    if provider_cfg and provider_cfg.get("base_url"):
+        return True
+    for env_var in get_base_url_env_vars(provider):
+        if os.environ.get(f"{_ENV_PREFIX}{env_var}"):
+            return True
+    return False
 
 
 def warn_on_split_credential_source(provider: str) -> None:
@@ -2278,8 +2568,9 @@ class ModelConfig:
 
         Returns:
             Parsed `ModelConfig` instance.
-                Returns empty config if file is missing, unreadable, or contains
-                invalid TOML syntax.
+                Returns empty config if file is missing, unreadable, contains
+                invalid TOML syntax, or is structurally invalid (valid TOML of
+                the wrong shape, e.g. a scalar `[models]`).
         """
         global _default_config_cache  # noqa: PLW0603  # Module-level cache requires global statement
         is_default = config_path is None
@@ -2298,6 +2589,12 @@ class ModelConfig:
         try:
             with config_path.open("rb") as f:
                 data = tomllib.load(f)
+            models_section = data.get("models", {})
+            config = cls(
+                default_model=models_section.get("default"),
+                recent_model=models_section.get("recent"),
+                providers=models_section.get("providers", {}),
+            )
         except tomllib.TOMLDecodeError as e:
             logger.warning(
                 "Config file %s has invalid TOML syntax: %s. "
@@ -2305,23 +2602,24 @@ class ModelConfig:
                 config_path,
                 e,
             )
-            fallback = cls()
-            if is_default:
-                _default_config_cache = fallback
-            return fallback
+            config = cls()
         except (PermissionError, OSError) as e:
             logger.warning("Could not read config file %s: %s", config_path, e)
-            fallback = cls()
-            if is_default:
-                _default_config_cache = fallback
-            return fallback
-
-        models_section = data.get("models", {})
-        config = cls(
-            default_model=models_section.get("default"),
-            recent_model=models_section.get("recent"),
-            providers=models_section.get("providers", {}),
-        )
+            config = cls()
+        except (AttributeError, TypeError) as e:
+            # Syntactically valid TOML can still have the wrong shape — a scalar
+            # `[models]`, a non-table `providers` — which surfaces here as an
+            # AttributeError from `.get(...)` or a TypeError from the dataclass
+            # constructor. Treat it like any other unreadable config rather than
+            # letting it crash callers (e.g. the /auth modal on Ctrl+R) that
+            # assume load() is total and never raises.
+            logger.warning(
+                "Config file %s is structurally invalid: %s. "
+                "Ignoring config file. Fix the file or delete it to reset.",
+                config_path,
+                e,
+            )
+            config = cls()
 
         # Validate config consistency
         config._validate()
@@ -2377,6 +2675,15 @@ class ModelConfig:
                     "(expected a string). Falling back to the default label.",
                     name,
                     display_name,
+                )
+
+            short_name = cast("object", provider.get("short_name"))
+            if short_name is not None and not isinstance(short_name, str):
+                logger.warning(
+                    "Provider '%s' has non-string 'short_name' value %r "
+                    "(expected a string). Falling back to the display name.",
+                    name,
+                    short_name,
                 )
 
             api_key_url = cast("object", provider.get("api_key_url"))
@@ -2567,6 +2874,19 @@ class ModelConfig:
         name = provider.get("display_name") if provider else None
         return name if isinstance(name, str) else None
 
+    def get_provider_short_name(self, provider_name: str) -> str | None:
+        """Get the configured compact brand name for a provider.
+
+        Args:
+            provider_name: The provider to look up.
+
+        Returns:
+            Compact brand name if configured, None otherwise.
+        """
+        provider = self.providers.get(provider_name)
+        name = provider.get("short_name") if provider else None
+        return name if isinstance(name, str) else None
+
     def get_provider_api_key_url(self, provider_name: str) -> str | None:
         """Get the configured API-key management URL for a provider.
 
@@ -2662,7 +2982,7 @@ class ModelConfig:
 def _save_toml_field(
     section: str,
     field: str,
-    value: str,
+    value: str | bool,
     config_path: Path | None = None,
 ) -> bool:
     """Read-modify-write a `[section].<field>` key in the config file.
@@ -2670,7 +2990,7 @@ def _save_toml_field(
     Args:
         section: TOML table name (e.g., `'models'`, `'agents'`).
         field: Key within the table (e.g., `'default'`, `'recent'`).
-        value: String value to persist.
+        value: String or boolean value to persist.
         config_path: Path to config file.
 
             Defaults to `~/.deepagents/config.toml`.
@@ -2682,30 +3002,31 @@ def _save_toml_field(
         config_path = DEFAULT_CONFIG_PATH
 
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Read existing config or start fresh
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
+            # Read existing config or start fresh
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
 
-        if section not in data:
-            data[section] = {}
-        data[section][field] = value
+            if section not in data:
+                data[section] = {}
+            data[section][field] = value
 
-        # Write to temp file then rename to prevent corruption if write is interrupted
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            # Clean up temp file on any failure
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            # Write to temp file then rename so an interrupted write can't corrupt
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                # Clean up temp file on any failure
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
         # `TypeError` covers `tomli_w.dump` rejecting a non-serializable
         # payload; `ValueError` covers things like `os.fdopen` on a
@@ -2718,6 +3039,28 @@ def _save_toml_field(
         global _default_config_cache  # noqa: PLW0603  # Module-level cache requires global statement
         _default_config_cache = None
         return True
+
+
+def save_goal_auto_accept_criteria(
+    enabled: bool,
+    config_path: Path | None = None,
+) -> bool:
+    """Persist whether Auto mode applies generated goal criteria without review.
+
+    Args:
+        enabled: Whether Auto should accept goal criteria automatically.
+        config_path: Path to config file. Defaults to
+            `~/.deepagents/config.toml`.
+
+    Returns:
+        `True` when the preference was saved, otherwise `False`.
+    """
+    return _save_toml_field(
+        "goals",
+        "auto_accept_criteria",
+        enabled,
+        config_path,
+    )
 
 
 def _save_model_field(
@@ -2778,34 +3121,215 @@ def clear_default_model(config_path: Path | None = None) -> bool:
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
 
-    if not config_path.exists():
-        return True  # Nothing to clear
-
     try:
-        with config_path.open("rb") as f:
-            data = tomllib.load(f)
+        with _config_write_lock:
+            if not config_path.exists():
+                return True  # Nothing to clear
 
-        models_section = data.get("models")
-        if not isinstance(models_section, dict) or "default" not in models_section:
-            return True  # Already absent
+            with config_path.open("rb") as f:
+                data = tomllib.load(f)
 
-        del models_section["default"]
+            models_section = data.get("models")
+            if not isinstance(models_section, dict) or "default" not in models_section:
+                return True  # Already absent
 
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            del models_section["default"]
+
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
         # See `_save_toml_field` for why `TypeError` / `ValueError` are
         # folded into the bool return contract.
         logger.exception("Could not clear default model preference")
         return False
     else:
+        global _default_config_cache  # noqa: PLW0603  # Module-level cache requires global statement
+        _default_config_cache = None
+        return True
+
+
+def save_effort_for_model(
+    model_spec: str,
+    effort: str,
+    config_path: Path | None = None,
+) -> bool:
+    """Persist the selected reasoning effort for a model.
+
+    Args:
+        model_spec: Model in `provider:model` format.
+        effort: Reasoning effort label selected by the user.
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        `True` if save succeeded, `False` if it failed.
+    """
+    return _update_effort_for_model(model_spec, effort, config_path)
+
+
+def load_effort_for_model(
+    model_spec: str,
+    config_path: Path | None = None,
+) -> str | None:
+    """Load the selected reasoning effort for a model.
+
+    Args:
+        model_spec: Model in `provider:model` format.
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        The persisted effort label, or `None`. `None` is returned both when no
+        preference is stored and when one exists but cannot be read (unreadable
+        file, invalid TOML, or a malformed `[effort]` section); the two cases
+        are not distinguished by the return value, but a read failure is always
+        logged rather than swallowed silently.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+    if not config_path.exists():
+        return None
+
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+        effort_section = data.get("effort")
+        if effort_section is None:
+            return None  # No preference stored; not a failure.
+        if not isinstance(effort_section, dict):
+            logger.warning(
+                "Ignoring malformed [effort] in %s: expected a table, got %s",
+                config_path,
+                type(effort_section).__name__,
+            )
+            return None
+        by_model = effort_section.get("by_model")
+        if by_model is None:
+            return None
+        if not isinstance(by_model, dict):
+            logger.warning(
+                "Ignoring malformed [effort.by_model] in %s: expected a table, got %s",
+                config_path,
+                type(by_model).__name__,
+            )
+            return None
+        effort = by_model.get(model_spec)
+        if effort is None:
+            return None
+        if not isinstance(effort, str):
+            logger.warning(
+                "Ignoring malformed reasoning effort for %s in %s: expected a "
+                "string, got %s",
+                model_spec,
+                config_path,
+                type(effort).__name__,
+            )
+            return None
+        return effort.strip() or None
+    except (OSError, tomllib.TOMLDecodeError):
+        logger.exception(
+            "Could not load reasoning effort preference for %s", model_spec
+        )
+        return None
+
+
+def clear_effort_for_model(
+    model_spec: str,
+    config_path: Path | None = None,
+) -> bool:
+    """Remove the selected reasoning effort for a model.
+
+    Args:
+        model_spec: Model in `provider:model` format.
+        config_path: Path to config file.
+
+            Defaults to `~/.deepagents/config.toml`.
+
+    Returns:
+        `True` if the entry was removed or absent, `False` if clearing failed.
+    """
+    return _update_effort_for_model(model_spec, None, config_path)
+
+
+def _update_effort_for_model(
+    model_spec: str,
+    effort: str | None,
+    config_path: Path | None = None,
+) -> bool:
+    """Read-modify-write one entry in `[effort.by_model]`.
+
+    Args:
+        model_spec: Model in `provider:model` format.
+        effort: Reasoning effort label to save, or `None` to clear it.
+        config_path: Path to config file.
+
+    Returns:
+        `True` if the update succeeded, `False` if it failed.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+    if effort is None and not config_path.exists():
+        return True
+
+    def _require_table(value: object, name: str) -> dict:
+        if not isinstance(value, dict):
+            msg = f"{name} must be a table"
+            raise TypeError(msg)
+        return value
+
+    try:
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
+
+            effort_section = _require_table(data.setdefault("effort", {}), "[effort]")
+            by_model = _require_table(
+                effort_section.setdefault("by_model", {}), "[effort.by_model]"
+            )
+
+            if effort is None:
+                if model_spec not in by_model:
+                    return True
+                del by_model[model_spec]
+                if not by_model:
+                    del effort_section["by_model"]
+                if not effort_section:
+                    del data["effort"]
+            else:
+                by_model[model_spec] = effort
+
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
+    except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        logger.exception(
+            "Could not update reasoning effort preference for %s", model_spec
+        )
+        return False
+    else:
+        # `_default_config_cache` holds only the `[models]` table (default /
+        # recent / providers), never `[effort]`, so this write cannot stale it.
+        # Invalidating anyway is defensive parity with the other config writers
+        # (`_save_toml_field`, `clear_default_model`, ...) that share the file.
         global _default_config_cache  # noqa: PLW0603  # Module-level cache requires global statement
         _default_config_cache = None
         return True
@@ -2825,8 +3349,8 @@ def is_warning_suppressed(key: str, config_path: Path | None = None) -> bool:
 
     Returns:
         `True` if the warning is suppressed, `False` otherwise (including
-            when the file is missing, unreadable, or has no
-            `[warnings]` section).
+            when the file is missing, unreadable, or has a missing or
+            malformed `[warnings]` section).
     """
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
@@ -2844,7 +3368,19 @@ def is_warning_suppressed(key: str, config_path: Path | None = None) -> bool:
         )
         return False
 
-    suppress_list = data.get("warnings", {}).get("suppress", [])
+    # A hand-edited `warnings = [...]` (or any non-table) would make the
+    # chained `.get` below raise `AttributeError`; fail open instead so a
+    # typo can never silently mute a warning.
+    warnings_section = data.get("warnings", {})
+    if not isinstance(warnings_section, dict):
+        logger.debug(
+            "[warnings] in %s should be a table, got %s",
+            config_path,
+            type(warnings_section).__name__,
+        )
+        return False
+
+    suppress_list = warnings_section.get("suppress", [])
     if not isinstance(suppress_list, list):
         logger.debug(
             "[warnings].suppress in %s should be a list, got %s",
@@ -2874,37 +3410,38 @@ def suppress_warning(key: str, config_path: Path | None = None) -> bool:
         config_path = DEFAULT_CONFIG_PATH
 
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
 
-        if "warnings" not in data:
-            data["warnings"] = {}
-        suppress_list = data["warnings"].get("suppress", [])
-        if not isinstance(suppress_list, list):
-            logger.debug(
-                "[warnings].suppress in %s should be a list, got %s",
-                config_path,
-                type(suppress_list).__name__,
-            )
-            suppress_list = []
-        if key not in suppress_list:
-            suppress_list.append(key)
-        data["warnings"]["suppress"] = suppress_list
+            if "warnings" not in data:
+                data["warnings"] = {}
+            suppress_list = data["warnings"].get("suppress", [])
+            if not isinstance(suppress_list, list):
+                logger.debug(
+                    "[warnings].suppress in %s should be a list, got %s",
+                    config_path,
+                    type(suppress_list).__name__,
+                )
+                suppress_list = []
+            if key not in suppress_list:
+                suppress_list.append(key)
+            data["warnings"]["suppress"] = suppress_list
 
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError):
         logger.exception("Could not save warning suppression for '%s'", key)
         return False
@@ -2931,37 +3468,958 @@ def unsuppress_warning(key: str, config_path: Path | None = None) -> bool:
         config_path = DEFAULT_CONFIG_PATH
 
     try:
-        if not config_path.exists():
-            return True  # nothing to remove
+        with _config_write_lock:
+            if not config_path.exists():
+                return True  # nothing to remove
 
-        with config_path.open("rb") as f:
-            data = tomllib.load(f)
+            with config_path.open("rb") as f:
+                data = tomllib.load(f)
 
-        suppress_list = data.get("warnings", {}).get("suppress", [])
-        if not isinstance(suppress_list, list):
-            logger.debug(
-                "[warnings].suppress in %s should be a list, got %s",
-                config_path,
-                type(suppress_list).__name__,
-            )
-            return True  # treat as nothing to remove
-        if key not in suppress_list:
-            return True  # already unsuppressed
+            suppress_list = data.get("warnings", {}).get("suppress", [])
+            if not isinstance(suppress_list, list):
+                logger.debug(
+                    "[warnings].suppress in %s should be a list, got %s",
+                    config_path,
+                    type(suppress_list).__name__,
+                )
+                return True  # treat as nothing to remove
+            if key not in suppress_list:
+                return True  # already unsuppressed
 
-        suppress_list.remove(key)
-        data.setdefault("warnings", {})["suppress"] = suppress_list
+            suppress_list.remove(key)
+            data.setdefault("warnings", {})["suppress"] = suppress_list
 
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError):
         logger.exception("Could not remove warning suppression for '%s'", key)
+        return False
+    return True
+
+
+class _McpProjectScope(NamedTuple):
+    """A resolved MCP trust identity and whether it is Git-common scoped.
+
+    A `NamedTuple` (mirroring `_git.RepositoryMetadata`) so the boolean slot is
+    self-documenting at every call site instead of a load-bearing positional.
+    """
+
+    identity: str
+    """Normalized trust identity: a Git common directory or an exact root."""
+
+    git_common_dir: bool
+    """Whether `identity` is a validated Git common-directory path."""
+
+
+@dataclass(frozen=True, order=True)
+class McpProjectServerApproval:
+    """A project-scoped, definition-bound MCP server approval.
+
+    Membership in a `McpServerTrustLists.approvals` set *is* the trust decision
+    (`is_enabled` reconstructs an approval and tests `approval in approvals`), so
+    value equality must line up between the write side
+    (`add_enabled_project_mcp_servers`) and the read side (`is_enabled`). Build new
+    approvals through `create` and persisted ones through `from_toml`, never the raw
+    constructor. Legacy unmarked entries intentionally retain their exact-worktree
+    scope, while new entries reconstruct the same transport-aware scope on both
+    sides. `order=True` exists only so `sorted()` yields deterministic TOML output.
+
+    The raw constructor only enforces non-emptiness (`__post_init__`), not that
+    `project_root` is normalized or that `fingerprint` is a real digest. A
+    hand-built instance is therefore *safe but useless*: with a mismatched root
+    or fingerprint it simply never equals a `create`/`from_toml` peer, so it
+    fails closed (nothing is trusted) rather than granting stray access — but it
+    also won't authorize anything. Always go through the factories.
+    """
+
+    project_root: str
+    """Shared fixed-URL identity or exact worktree-scoped identity."""
+
+    name: str
+    """MCP server name within the project config."""
+
+    fingerprint: str
+    """Fingerprint of the approved MCP server definition."""
+
+    git_common_dir: bool = field(default=False, kw_only=True)
+    """Whether `project_root` is a persisted Git common-directory identity."""
+
+    def __post_init__(self) -> None:
+        """Reject degenerate approvals so a bad one can't silently never match.
+
+        An empty `project_root`, `name`, or `fingerprint` can only ever equal a
+        malformed peer, so forbid the state entirely rather than let it persist.
+
+        Raises:
+            ValueError: If any field is empty or whitespace-only.
+        """
+        if not (
+            self.project_root.strip() and self.name.strip() and self.fingerprint.strip()
+        ):
+            msg = (
+                "McpProjectServerApproval requires non-empty project_root, name, "
+                "and fingerprint"
+            )
+            raise ValueError(msg)
+
+    @classmethod
+    def _create_for_scope(
+        cls,
+        *,
+        scope: _McpProjectScope,
+        name: str,
+        server: JsonValue,
+    ) -> McpProjectServerApproval:
+        """Build an approval from one already-resolved trust scope.
+
+        Args:
+            scope: Normalized identity and Git-common marker.
+            name: MCP server name.
+            server: Parsed MCP server definition to fingerprint.
+
+        Returns:
+            The normalized, definition-bound approval.
+        """
+        return cls(
+            project_root=scope.identity,
+            name=name.strip(),
+            fingerprint=fingerprint_mcp_server_config(server),
+            git_common_dir=scope.git_common_dir,
+        )
+
+    @classmethod
+    def create(
+        cls, *, project_root: str | Path | None, name: str, server: JsonValue
+    ) -> McpProjectServerApproval | None:
+        """Build an approval, normalizing the root and fingerprinting `server`.
+
+        Remote servers with fixed URLs use the validated Git common directory so
+        their approvals can be shared across linked worktrees. Local commands and
+        remote definitions with interpolated URLs use the exact resolved worktree
+        because their behavior can differ between checkouts.
+
+        Args:
+            project_root: Project root to normalize.
+            name: MCP server name.
+            server: Parsed MCP server definition to fingerprint.
+
+        Returns:
+            The approval, or `None` when `project_root` cannot be normalized.
+        """
+        scope = _normalize_mcp_project_scope(
+            project_root,
+            share_across_worktrees=_mcp_server_uses_remote_transport(server),
+        )
+        if scope is None:
+            return None
+        return cls._create_for_scope(scope=scope, name=name, server=server)
+
+    @classmethod
+    def from_toml(cls, item: Mapping[str, object]) -> McpProjectServerApproval | None:
+        """Deserialize a persisted approval table, normalizing the root.
+
+        Legacy entries without `git_common_dir` remain scoped to their exact
+        stored worktree. Marked entries retain their exact Git identity, so stale
+        metadata cannot redirect them to an enclosing repository.
+
+        Args:
+            item: A parsed TOML table with `project_root`, `name`, and
+                `fingerprint` string fields plus an optional `git_common_dir`
+                boolean.
+
+        Returns:
+            The approval, or `None` for a malformed table — fail-closed for an
+            allowlist.
+        """
+        project_root = item.get("project_root")
+        name = item.get("name")
+        fingerprint = item.get("fingerprint")
+        git_common_dir = item.get("git_common_dir", False)
+        if not (
+            isinstance(project_root, str)
+            and project_root.strip()
+            and isinstance(name, str)
+            and name.strip()
+            and isinstance(fingerprint, str)
+            and fingerprint.strip()
+            and isinstance(git_common_dir, bool)
+        ):
+            return None
+
+        if git_common_dir:
+            normalized_root = _normalize_persisted_git_common_dir(project_root)
+            normalized_is_common = True
+        else:
+            scope = _normalize_mcp_project_scope(
+                project_root, share_across_worktrees=False
+            )
+            if scope is None:
+                return None
+            normalized_root, normalized_is_common = scope.identity, scope.git_common_dir
+        if normalized_root is None:
+            return None
+        return cls(
+            project_root=normalized_root,
+            name=name.strip(),
+            fingerprint=fingerprint.strip(),
+            git_common_dir=normalized_is_common,
+        )
+
+    def as_toml(self) -> dict[str, str | bool]:
+        """Return a TOML-serializable representation."""
+        item: dict[str, str | bool] = {
+            "project_root": self.project_root,
+            "name": self.name,
+            "fingerprint": self.fingerprint,
+        }
+        if self.git_common_dir:
+            item["git_common_dir"] = True
+        return item
+
+
+def _normalize_mcp_project_scope(
+    project_root: str | Path | None,
+    *,
+    share_across_worktrees: bool,
+) -> _McpProjectScope | None:
+    """Resolve an MCP trust identity and whether it is Git-common scoped.
+
+    Args:
+        project_root: Project root path to normalize.
+        share_across_worktrees: Whether a validated Git common directory may be
+            used instead of the exact worktree root.
+
+    Returns:
+        One of three outcomes:
+
+        - `(<git-common-dir>, True)` when `share_across_worktrees` is set and the
+          resolved root validates as a Git worktree.
+        - `(<resolved-root>, False)` otherwise.
+        - `(<unresolved-expanded-root>, False)` when `resolve()` raises `OSError`;
+          the returned string is the expanded-but-unresolved path. A transient
+          resolve failure on only one of the write/read sides then yields
+          different identity strings and a spurious re-prompt (fail-closed),
+          never a false match.
+
+        Returns `None` only when `project_root` is `None`, cannot be expanded, or
+        resolution detects a path loop (`RuntimeError`).
+    """
+    if project_root is None:
+        return None
+    try:
+        expanded_root = Path(project_root).expanduser()
+    except (OSError, RuntimeError):
+        logger.warning(
+            "Could not expand MCP project root %s",
+            project_root,
+            exc_info=True,
+        )
+        return None
+
+    try:
+        resolved_root = expanded_root.resolve()
+    except OSError:
+        logger.warning(
+            "Could not resolve MCP project root %s",
+            project_root,
+            exc_info=True,
+        )
+        return _McpProjectScope(str(expanded_root), False)
+    except RuntimeError:
+        logger.warning(
+            "Could not resolve MCP project root %s",
+            project_root,
+            exc_info=True,
+        )
+        return None
+
+    if share_across_worktrees:
+        common_dir = find_git_common_dir(resolved_root)
+        if common_dir is not None:
+            return _McpProjectScope(str(common_dir), True)
+    return _McpProjectScope(str(resolved_root), False)
+
+
+def _normalize_persisted_git_common_dir(project_root: str) -> str | None:
+    """Normalize a marked Git identity without following or rediscovering it.
+
+    Args:
+        project_root: Persisted Git common-directory path.
+
+    Returns:
+        The absolute lexical path, or `None` for an invalid stored identity.
+    """
+    try:
+        expanded_root = Path(project_root).expanduser()
+    except (OSError, RuntimeError):
+        logger.warning(
+            "Could not expand persisted MCP Git identity %s",
+            project_root,
+            exc_info=True,
+        )
+        return None
+    if not expanded_root.is_absolute():
+        logger.warning(
+            "Persisted MCP Git identity %s is not absolute; dropping approval",
+            project_root,
+        )
+        return None
+    try:
+        return os.path.abspath(expanded_root)  # noqa: PTH100  # do not follow links
+    except (OSError, RuntimeError, ValueError):
+        logger.warning(
+            "Could not normalize persisted MCP Git identity %s",
+            project_root,
+            exc_info=True,
+        )
+        return None
+
+
+_REMOTE_MCP_TRANSPORTS = frozenset(
+    {"http", "sse", "streamable_http", "streamable-http"}
+)
+
+
+def _mcp_server_uses_remote_transport(server: JsonValue) -> bool:
+    """Return whether `server` is confidently a remote-only definition.
+
+    Malformed, ambiguous, or environment-dependent definitions stay
+    worktree-scoped. A definition containing `command` is never shared even if it
+    also contains a remote transport field, and an interpolated URL can resolve to
+    different endpoints from different worktree `.env` files.
+
+    Args:
+        server: Parsed MCP server definition.
+
+    Returns:
+        Whether approvals for the definition may be shared across worktrees.
+    """
+    if not isinstance(server, dict) or "command" in server:
+        return False
+    url = server.get("url")
+    if not isinstance(url, str) or "${" in url:
+        return False
+    transport = server.get("type") or server.get("transport")
+    return transport is None or (
+        isinstance(transport, str) and transport in _REMOTE_MCP_TRANSPORTS
+    )
+
+
+def normalize_mcp_project_root(project_root: str | Path | None) -> str | None:
+    """Normalize an exact project root for persisted MCP trust comparisons.
+
+    Args:
+        project_root: Project root path to normalize.
+
+    Returns:
+        The resolved absolute project root (or the expanded, unresolved path when
+        `resolve()` raises `OSError`), or `None` when `project_root` is
+        unavailable.
+    """
+    scope = _normalize_mcp_project_scope(project_root, share_across_worktrees=False)
+    return scope.identity if scope is not None else None
+
+
+def fingerprint_mcp_server_config(server: JsonValue) -> str:
+    """Return a stable fingerprint for an MCP server definition.
+
+    The contract is a JSON-serializable value (in practice the `dict` parsed
+    from `.mcp.json`, though a malformed entry may be any JSON scalar/array); a
+    non-serializable input raises `TypeError` from `json.dumps`. `sort_keys=True`
+    makes the digest independent of key order, so reordering fields in the config
+    does not force a re-prompt.
+
+    Args:
+        server: Parsed MCP server config (a JSON-serializable value).
+
+    Returns:
+        A SHA-256 fingerprint over the canonical JSON representation.
+    """
+    encoded = json.dumps(
+        server,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+@dataclass(frozen=True)
+class McpServerTrustLists:
+    """User-level allow/deny lists for project MCP servers.
+
+    Sourced only from the user's own configuration — the home `config.toml`, the
+    global `~/.deepagents/.env`, and shell-exported env — never from a repo, so a
+    committed `.mcp.json` cannot self-approve. Persisted approvals for fixed
+    remote URLs bind to one validated local Git repository. Local commands and
+    interpolated remote URLs bind to the exact resolved worktree. All include the
+    server definition's fingerprint. Env-sourced approvals remain explicit
+    process-wide name approvals.
+
+    The "reject wins" invariant — a name in both approval and rejection data is
+    only rejected — is enforced in `__post_init__`, so every instance is disjoint
+    no matter how it was constructed; callers need not pre-subtract.
+    """
+
+    enabled: frozenset[str]
+    """Env-sourced server names pre-approved for any project config."""
+
+    disabled: frozenset[str]
+    """Server names always rejected; reject wins over approvals and over trust."""
+
+    read_error: str | None = field(default=None, compare=False)
+    """Non-`None` when the user's `config.toml` existed but its trust policy
+    could not be fully read: the file was unreadable/unparseable, its `[mcp]`
+    value was not a table, or its `disabled_project_servers` was a wrong type
+    that could not be interpreted as a deny list. Callers must treat this as
+    fail-closed (do not grant whole-config project trust) and surface it, rather
+    than proceeding with a deny list that may not have loaded — use `load_failed`
+    for that check. Note the resolved `enabled`/`disabled` sets are not
+    necessarily empty here: names from a still-readable source (the env vars)
+    continue to apply. Excluded from equality so a failed load still compares
+    equal to empty lists for tests that only care about the resolved names."""
+
+    approvals: frozenset[McpProjectServerApproval] = field(
+        default_factory=frozenset, kw_only=True
+    )
+    """Project-scoped approvals loaded from user `config.toml`."""
+
+    legacy_ignored: frozenset[str] = field(
+        default_factory=frozenset, compare=False, kw_only=True
+    )
+    """Names found in a legacy `[mcp].enabled_project_servers` list that this
+    build no longer honors. Non-empty means the user relied on the removed flat
+    allowlist, so those servers silently stopped loading; callers should surface
+    it (a bare `logger.warning` is invisible outside debug mode) so
+    non-interactive paths can explain the change. Diagnostic, not resolved
+    policy — excluded from equality like `read_error`."""
+
+    legacy_env_ignored: bool = field(default=False, compare=False, kw_only=True)
+    """`True` when the removed `DEEPAGENTS_CODE_ENABLED_PROJECT_MCP_SERVERS` env
+    var is set. It was renamed to the `DANGEROUSLY_`-prefixed var and is no longer
+    read, so its names silently stopped pre-approving. The diagnostic twin of
+    `legacy_ignored` for the env surface; callers should surface the rename so the
+    change is not silent. Excluded from equality like `read_error`."""
+
+    malformed_approvals: int = field(default=0, compare=False, kw_only=True)
+    """Count of `[mcp].enabled_project_server_approvals` rows that were dropped as
+    malformed (wrong-typed key, non-table entry, a table missing/blank
+    `project_root`/`name`/`fingerprint`, or an invalid Git identity marker).
+    Non-zero means a persisted approval
+    could not be read, so its server silently re-prompts; callers should surface
+    it (a bare `logger.warning` is invisible outside debug mode) for parity with
+    `legacy_ignored`. Diagnostic, not resolved policy — excluded from equality."""
+
+    def __post_init__(self) -> None:
+        """Enforce reject precedence by stripping disabled names from both sets.
+
+        A rejected name must never survive in `enabled` or `approvals`, whatever
+        the caller passed, so a future allow-first consumer can't be tricked
+        into loading a denied server. Frozen dataclass, so assign via
+        `object.__setattr__`.
+        """
+        if self.enabled & self.disabled:
+            object.__setattr__(self, "enabled", self.enabled - self.disabled)
+        if any(approval.name in self.disabled for approval in self.approvals):
+            object.__setattr__(
+                self,
+                "approvals",
+                frozenset(
+                    approval
+                    for approval in self.approvals
+                    if approval.name not in self.disabled
+                ),
+            )
+
+    @property
+    def load_failed(self) -> bool:
+        """Whether the user's trust policy failed to load (see `read_error`).
+
+        Callers gating on trust MUST check this and fail closed: a failed load
+        means a configured deny may be missing, so whole-config project trust
+        must not be honored. Named so the fail-closed contract is discoverable
+        rather than resting on every caller remembering the `read_error`
+        sentinel.
+        """
+        return self.read_error is not None
+
+    def is_enabled(
+        self,
+        name: str,
+        *,
+        project_root: str | Path | None,
+        server: JsonValue,
+    ) -> bool:
+        """Return whether `server` is approved by name or scoped fingerprint.
+
+        Args:
+            name: MCP server name.
+            project_root: Resolved project root for the config that defined it.
+            server: Parsed MCP server config for fingerprint comparison.
+
+        Returns:
+            `True` when the server is approved and not disabled.
+        """
+        if not name.strip():
+            # A blank name can only come from a malformed config. Fail closed
+            # here rather than let `McpProjectServerApproval.create` raise
+            # `ValueError` from its non-empty invariant out of the trust filter.
+            return False
+        # These membership tests use the raw (unstripped) `name`, while the
+        # approval path below strips it via `create`. Reject precedence for a
+        # whitespace-padded name (e.g. `" docs "` vs `disabled={"docs"}`) does
+        # NOT rest on this check — it survives only because `__post_init__`
+        # already stripped every disabled name out of `enabled` and `approvals`
+        # (it compares the always-stripped `approval.name`). Keep that stripping
+        # in sync with this check: a padded name sails past both lines here.
+        if name in self.disabled:
+            return False
+        if name in self.enabled:
+            return True
+        approval = McpProjectServerApproval.create(
+            project_root=project_root, name=name, server=server
+        )
+        if approval is None:
+            return False
+        if approval in self.approvals:
+            return True
+        if not approval.git_common_dir:
+            return False
+
+        # Approvals written before remote servers gained a shared Git identity
+        # have no marker and remain bound to their original worktree. Honor that
+        # exact-root entry there without broadening it to sibling worktrees.
+        legacy_scope = _normalize_mcp_project_scope(
+            project_root, share_across_worktrees=False
+        )
+        if legacy_scope is None:
+            return False
+        legacy_approval = McpProjectServerApproval._create_for_scope(
+            scope=legacy_scope, name=name, server=server
+        )
+        return legacy_approval in self.approvals
+
+
+def _parse_csv_env(name: str) -> list[str] | None:
+    """Parse a comma-separated env var into a list of trimmed, non-empty names.
+
+    Returns:
+        The parsed list when the variable is set (possibly empty after
+            trimming), or `None` when the variable is unset so callers can
+            distinguish "unset, fall back to TOML" from "set but empty".
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _toml_str_list(
+    value: object, *, key: str, config_path: Path
+) -> tuple[list[str], bool]:
+    """Coerce a raw TOML value into a list of trimmed, non-empty server names.
+
+    A bare string is *split on commas* (e.g. `disabled_project_servers = "a, b"`
+    yields `["a", "b"]`), so a scalar written in the TOML parses identically to
+    the comma-separated env form in `_parse_csv_env` — the two forms can never
+    silently diverge into one bogus `"a, b"` token that matches no server. Non-
+    string list elements are dropped (with a log) while the surrounding valid
+    names survive. A genuinely wrong type (number, table, bool) cannot be
+    interpreted as names at all: it yields an empty list *and* flags `malformed`,
+    so a caller enforcing a deny list can fail closed rather than silently drop
+    the rejection.
+
+    Args:
+        value: The raw value read from the `[mcp]` table (or `None` when the
+            key is absent).
+        key: The TOML key name, used only for log context.
+        config_path: The config file the value came from, for log context.
+
+    Returns:
+        `(names, malformed)`. `names` are the trimmed, non-empty server names.
+            `malformed` is `True` only when `value` is present but neither a
+            string nor a list (so it could not be read as names); it is `False`
+            for an absent value, a string, or any list — even one whose non-
+            string elements were dropped.
+    """
+    if value is None:
+        return [], False
+    if isinstance(value, str):
+        # Split on commas so a bare string parses exactly like the env form; a
+        # single name with no comma still yields a one-element list.
+        return [item.strip() for item in value.split(",") if item.strip()], False
+    if not isinstance(value, list):
+        logger.warning(
+            "[mcp].%s in %s should be a list of strings, got %s; ignoring it",
+            key,
+            config_path,
+            type(value).__name__,
+        )
+        return [], True
+    result: list[str] = []
+    discarded = 0
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+        else:
+            discarded += 1
+    if discarded:
+        logger.warning(
+            "[mcp].%s in %s: ignored %d non-string or empty entr%s",
+            key,
+            config_path,
+            discarded,
+            "y" if discarded == 1 else "ies",
+        )
+    return result, False
+
+
+def _toml_project_server_approvals(
+    value: object, *, config_path: Path
+) -> tuple[list[McpProjectServerApproval], int]:
+    """Parse `[mcp].enabled_project_server_approvals` entries.
+
+    Args:
+        value: Raw TOML value from the `[mcp]` table.
+        config_path: Config file the value came from, for log context.
+
+    Returns:
+        `(approvals, dropped)`: the well-formed project-scoped approvals and the
+            count of malformed rows ignored. Dropping is fail-closed for an
+            allowlist; the count lets callers surface the loss (a bare
+            `logger.warning` is invisible outside debug mode) so a corrupt saved
+            approval doesn't just silently re-prompt.
+    """
+    if value is None:
+        return [], 0
+    if not isinstance(value, list):
+        logger.warning(
+            "[mcp].enabled_project_server_approvals in %s should be a list of "
+            "tables; ignoring it",
+            config_path,
+        )
+        # Count the whole-key type error as one dropped diagnostic so it is
+        # surfaced rather than only logged.
+        return [], 1
+
+    approvals: list[McpProjectServerApproval] = []
+    dropped = 0
+    for item in value:
+        if not isinstance(item, dict):
+            logger.warning(
+                "[mcp].enabled_project_server_approvals in %s ignored a "
+                "non-table entry",
+                config_path,
+            )
+            dropped += 1
+            continue
+        approval = McpProjectServerApproval.from_toml(
+            cast("Mapping[str, object]", item)
+        )
+        if approval is None:
+            logger.warning(
+                "[mcp].enabled_project_server_approvals in %s ignored a "
+                "malformed entry",
+                config_path,
+            )
+            dropped += 1
+            continue
+        approvals.append(approval)
+    return approvals, dropped
+
+
+def load_mcp_server_trust_lists(
+    config_path: Path | None = None,
+) -> McpServerTrustLists:
+    """Load per-server project MCP allow/deny lists from user-level config.
+
+    Security boundary: this reads the `[mcp]` table only from the user-level
+    `config.toml` (`DEFAULT_CONFIG_PATH`, i.e. `~/.deepagents/config.toml`) and
+    the `DEEPAGENTS_CODE_DANGEROUSLY_ENABLE_PROJECT_MCP_SERVERS` /
+    `DEEPAGENTS_CODE_DISABLED_PROJECT_MCP_SERVERS` process env vars — never from
+    a project's `.mcp.json` or any repo-committed file. There is no
+    project-level `config.toml` discovery, so an attacker who commits a
+    malicious `.mcp.json` plus an in-repo config cannot pre-approve their own
+    servers; the approval must live in the user's home config. This mirrors
+    Claude Code's "untrusted folder → only non-checked-in settings" rule.
+
+    Source resolution differs by list, matching each one's security direction:
+
+    - `enabled` (permissive): the env var is an explicit process-wide name
+        allowlist.
+    - `approvals` (permissive): TOML approvals bind fixed remote URLs to one
+        validated local Git repository (shared across its worktrees). Local commands
+        and interpolated remote URLs bind to an exact worktree. All include a
+        server-definition fingerprint and remain active alongside env-enabled names,
+        so setting the process-wide escape hatch does not discard choices remembered
+        by the interactive prompt.
+        Legacy flat TOML
+        `enabled_project_servers` entries are ignored because they cannot be safely
+        scoped.
+    - `disabled` (restrictive): the env var *unions* with the TOML list — denies
+        accumulate and a lower-effort source can never silently empty a deny
+        entry set in the other, which would be a fail-open. There is
+        deliberately no way to *remove* a configured deny via env.
+
+    Rejection wins: a name appearing in approval and disabled data is reported
+    only in `disabled`.
+
+    Args:
+        config_path: Config file to read. Defaults to `DEFAULT_CONFIG_PATH`;
+            callers should not point this at a project path — doing so would
+            defeat the boundary above.
+
+    Returns:
+        The resolved `McpServerTrustLists`. A missing file yields empty lists
+            (the normal "unset" case). `read_error` is set (so callers can fail
+            closed instead of treating a broken config as "nothing denied") when
+            the file exists but cannot be read/parsed, when `[mcp]` is not a
+            table, or when `disabled_project_servers` is a wrong type that cannot
+            be read as a deny list; env-sourced names still apply in that case.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+
+    toml_approvals: list[McpProjectServerApproval] = []
+    malformed_approvals = 0
+    toml_disabled: list[str] = []
+    legacy_ignored: list[str] = []
+    read_error: str | None = None
+    try:
+        if config_path.exists():
+            with config_path.open("rb") as f:
+                data = tomllib.load(f)
+            mcp_section = data.get("mcp", {})
+            if isinstance(mcp_section, dict):
+                toml_approvals, malformed_approvals = _toml_project_server_approvals(
+                    mcp_section.get("enabled_project_server_approvals"),
+                    config_path=config_path,
+                )
+                legacy_enabled, _ = _toml_str_list(
+                    mcp_section.get("enabled_project_servers"),
+                    key="enabled_project_servers",
+                    config_path=config_path,
+                )
+                if legacy_enabled:
+                    legacy_ignored = legacy_enabled
+                    logger.warning(
+                        "[mcp].enabled_project_servers in %s is ignored; run "
+                        "the project MCP approval prompt again to save "
+                        "project-scoped approvals",
+                        config_path,
+                    )
+                toml_disabled, disabled_malformed = _toml_str_list(
+                    mcp_section.get("disabled_project_servers"),
+                    key="disabled_project_servers",
+                    config_path=config_path,
+                )
+                if disabled_malformed:
+                    # A wrong-typed deny list cannot be read, so proceeding as
+                    # if nothing were denied would be a fail-open. Surface it and
+                    # fail closed, mirroring the unreadable-file path below.
+                    read_error = (
+                        f"[mcp].disabled_project_servers in {config_path} must be "
+                        "a list of strings; refusing to proceed with an "
+                        "unenforced deny list"
+                    )
+            else:
+                # An `[mcp]` value that is not a table means the deny list is
+                # unreadable too; fail closed rather than leave it unenforced.
+                read_error = (
+                    f"[mcp] in {config_path} must be a table, got "
+                    f"{type(mcp_section).__name__}"
+                )
+                logger.warning(
+                    "[mcp] in %s should be a table, got %s; treating project "
+                    "configs as untrusted",
+                    config_path,
+                    type(mcp_section).__name__,
+                )
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        # The file exists but is unreadable/unparseable. Record it so callers
+        # fail closed rather than silently proceeding with an empty deny list.
+        read_error = f"Could not read MCP trust lists from {config_path}: {exc}"
+        logger.warning(
+            "Could not read %s for MCP server trust lists; treating project "
+            "configs as untrusted",
+            config_path,
+            exc_info=True,
+        )
+
+    env_enabled = _parse_csv_env(_env_vars.DANGEROUSLY_ENABLE_PROJECT_MCP_SERVERS)
+    env_disabled = _parse_csv_env(_env_vars.DISABLED_PROJECT_MCP_SERVERS)
+    # The old name was renamed to the `DANGEROUSLY_`-prefixed var and is no
+    # longer read; flag it set-but-ignored so callers can explain the rename
+    # instead of the names silently ceasing to pre-approve.
+    legacy_env_ignored = _env_vars.LEGACY_ENABLED_PROJECT_MCP_SERVERS in os.environ
+    if legacy_env_ignored:
+        logger.warning(
+            "%s is no longer used; it was renamed to %s",
+            _env_vars.LEGACY_ENABLED_PROJECT_MCP_SERVERS,
+            _env_vars.DANGEROUSLY_ENABLE_PROJECT_MCP_SERVERS,
+        )
+
+    # Process-wide env names and scoped TOML approvals are independent grants.
+    # Keep both active so the escape hatch cannot make the interactive prompt's
+    # successfully persisted choices ineffective on the next launch.
+    enabled = frozenset(env_enabled or ())
+    approvals = frozenset(() if read_error is not None else toml_approvals)
+    disabled = frozenset(toml_disabled) | frozenset(env_disabled or ())
+    # Corner: when `read_error` is set because `config.toml` was unreadable,
+    # `toml_disabled` is lost, so a name that is both TOML-`disabled` *and*
+    # exported in `DANGEROUSLY_ENABLE_PROJECT_MCP_SERVERS` would survive here —
+    # "reject wins" does not hold in that one corner. It requires a
+    # self-contradicting config plus the explicit `DANGEROUSLY_` opt-in, and the
+    # read error is surfaced to the user, so it stays an accepted footgun rather
+    # than a silent fail-open.
+    # Reject precedence is enforced by `McpServerTrustLists.__post_init__`, so no
+    # subtraction here.
+    return McpServerTrustLists(
+        enabled=enabled,
+        disabled=disabled,
+        approvals=approvals,
+        read_error=read_error,
+        legacy_ignored=frozenset(legacy_ignored),
+        legacy_env_ignored=legacy_env_ignored,
+        malformed_approvals=malformed_approvals,
+    )
+
+
+def add_enabled_project_mcp_servers(
+    names: Iterable[str],
+    config_path: Path | None = None,
+    *,
+    project_root: str | Path | None = None,
+    server_configs: Mapping[str, JsonValue] | None = None,
+) -> bool:
+    """Persist project-scoped MCP server approvals.
+
+    Backs the interactive approval prompt's "always allow" choice: the given
+    names are added to the user-level `config.toml` allowlist with each server
+    definition's fingerprint. Fixed remote URLs use the local Git repository
+    identity and are shared by its linked worktrees. Local commands and
+    interpolated remote URLs use the exact worktree root. A different clone or
+    changed definition asks again.
+
+    Defaults to the user-level config (`DEFAULT_CONFIG_PATH`), the sole source
+    `load_mcp_server_trust_lists` reads the allowlist from — so writing to the
+    user's home config is what preserves the read-side trust boundary (a
+    committed `.mcp.json` can never self-approve). Any name being persisted is
+    also pruned from the deprecated flat `[mcp].enabled_project_servers` key
+    (the key is removed once empty), migrating callers off the ignored legacy
+    list. The write is atomic (`tempfile.mkstemp` + `Path.replace`) and holds
+    `_config_write_lock` across the whole read-modify-write, matching
+    `suppress_warning`.
+
+    Args:
+        names: Server names to add to the allowlist. Blank/whitespace-only
+            names are ignored; a call with no usable names is a no-op success.
+        config_path: Config file to write. Defaults to `DEFAULT_CONFIG_PATH`
+            (`~/.deepagents/config.toml`). Callers should not point this at a
+            project path: the loader only ever reads the user-level config, so
+            an allowlist written elsewhere is never honored.
+        project_root: Project root whose MCP server definitions were approved.
+        server_configs: Current server definitions keyed by server name.
+
+    Returns:
+        `True` if the save succeeded (or there was nothing to add), `False` on
+            I/O, parse failure, an unknown server name, or missing
+            project/server context.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+
+    clean_names = [name.strip() for name in names if name and name.strip()]
+    if not clean_names:
+        return True
+
+    if project_root is None or server_configs is None:
+        logger.error(
+            "Cannot save enabled project MCP servers without project root and "
+            "server definitions"
+        )
+        return False
+
+    approvals_to_add: list[McpProjectServerApproval] = []
+    for name in clean_names:
+        if name not in server_configs:
+            logger.error("Cannot save unknown project MCP server %r", name)
+            return False
+        approval = McpProjectServerApproval.create(
+            project_root=project_root,
+            name=name,
+            server=server_configs[name],
+        )
+        if approval is None:
+            logger.error("Could not normalize project root for MCP server %r", name)
+            return False
+        approvals_to_add.append(approval)
+
+    try:
+        # Hold the shared lock across read-through-replace: the atomic rename
+        # alone only prevents torn writes, not the lost update where a
+        # concurrent config.toml writer reads the same snapshot and its
+        # `replace()` lands last, silently dropping this approval. See the
+        # `_config_write_lock` contract; `suppress_warning` guards the same way.
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
+
+            mcp_section = data.get("mcp")
+            if not isinstance(mcp_section, dict):
+                mcp_section = {}
+            existing, _ = _toml_project_server_approvals(
+                mcp_section.get("enabled_project_server_approvals"),
+                config_path=config_path,
+            )
+            merged = set(existing) | set(approvals_to_add)
+            mcp_section["enabled_project_server_approvals"] = [
+                approval.as_toml() for approval in sorted(merged)
+            ]
+            legacy, legacy_malformed = _toml_str_list(
+                mcp_section.get("enabled_project_servers"),
+                key="enabled_project_servers",
+                config_path=config_path,
+            )
+            if legacy and not legacy_malformed:
+                migrated = set(clean_names)
+                remaining = [name for name in legacy if name not in migrated]
+                if remaining:
+                    mcp_section["enabled_project_servers"] = remaining
+                else:
+                    mcp_section.pop("enabled_project_servers", None)
+            data["mcp"] = mcp_section
+
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
+    except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        # Matches `suppress_warning`: `TypeError` covers `tomli_w.dump`
+        # rejecting a non-serializable payload; `ValueError` covers things like
+        # `os.fdopen` on a closed fd. Folding them in keeps the `bool` contract
+        # intact so the caller degrades to a "could not remember" warning
+        # instead of crashing with a raw traceback.
+        logger.exception(
+            "Could not save enabled project MCP servers to %s", config_path
+        )
         return False
     return True
 
@@ -3117,27 +4575,28 @@ def save_thread_columns(
         config_path = DEFAULT_CONFIG_PATH
 
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
 
-        if "threads" not in data:
-            data["threads"] = {}
-        data["threads"]["columns"] = columns
+            if "threads" not in data:
+                data["threads"] = {}
+            data["threads"]["columns"] = columns
 
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError):
         logger.exception("Could not save thread column preferences")
         return False
@@ -3182,24 +4641,25 @@ def save_thread_relative_time(enabled: bool, config_path: Path | None = None) ->
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
-        if "threads" not in data:
-            data["threads"] = {}
-        data["threads"]["relative_time"] = enabled
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
+            if "threads" not in data:
+                data["threads"] = {}
+            data["threads"]["relative_time"] = enabled
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError):
         logger.exception("Could not save thread relative_time preference")
         return False
@@ -3231,6 +4691,65 @@ def load_thread_sort_order(config_path: Path | None = None) -> str:
     return "updated_at"
 
 
+STARTUP_MODE_MANUAL = "manual"
+"""Startup approval mode that keeps human-in-the-loop approvals enabled."""
+
+STARTUP_MODE_AUTO = "auto"
+"""Startup approval mode that uses classifier-backed action review."""
+
+STARTUP_MODE_YOLO = "yolo"
+"""Startup approval mode that executes gated actions without review."""
+
+STARTUP_MODE_DANGEROUSLY_AUTO = "dangerously-auto"
+"""Rejected legacy spelling retained only for migration diagnostics."""
+
+VALID_STARTUP_MODES = frozenset(
+    {STARTUP_MODE_MANUAL, STARTUP_MODE_AUTO, STARTUP_MODE_YOLO}
+)
+"""Accepted values for the `[startup].mode` config option."""
+
+DEFAULT_STARTUP_MODE = STARTUP_MODE_MANUAL
+"""Fallback startup mode when `[startup].mode` is missing, unreadable, or invalid."""
+
+
+def load_startup_mode(config_path: Path | None = None) -> str:
+    """Load the default startup approval mode from config.toml.
+
+    Reads `[startup].mode`, which accepts fail-closed `manual`, classifier-backed
+    `auto`, or unrestricted `yolo`. The removed `dangerously-auto` spelling is
+    invalid and falls back to `manual`.
+
+    Args:
+        config_path: Path to config file.
+
+    Returns:
+        `"manual"`, `"auto"`, or `"yolo"`; falls back to `"manual"` when
+        unset, unreadable, or invalid.
+    """
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+    try:
+        if not config_path.exists():
+            return DEFAULT_STARTUP_MODE
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+        startup = data.get("startup")
+        value = startup.get("mode") if isinstance(startup, dict) else None
+        # `value` may be any TOML type; guard against non-strings (e.g. an
+        # array or table) before the frozenset membership test, which would
+        # otherwise raise `TypeError: unhashable type` and crash startup.
+        if isinstance(value, str) and value in VALID_STARTUP_MODES:
+            return value
+        if value is not None:
+            logger.warning(
+                "Ignoring [startup].mode=%r (expected 'manual', 'auto', or 'yolo')",
+                value,
+            )
+    except (OSError, tomllib.TOMLDecodeError):
+        logger.debug("Could not read startup mode config", exc_info=True)
+    return DEFAULT_STARTUP_MODE
+
+
 def save_thread_sort_order(sort_order: str, config_path: Path | None = None) -> bool:
     """Save the sort order preference for the thread selector.
 
@@ -3252,24 +4771,25 @@ def save_thread_sort_order(sort_order: str, config_path: Path | None = None) -> 
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
-        if "threads" not in data:
-            data["threads"] = {}
-        data["threads"]["sort_order"] = sort_order
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except Exception:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
+            if "threads" not in data:
+                data["threads"] = {}
+            data["threads"]["sort_order"] = sort_order
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError):
         logger.exception("Could not save thread sort_order preference")
         return False
@@ -3296,25 +4816,26 @@ def save_thread_scope(scope: str, config_path: Path | None = None) -> bool:
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        if config_path.exists():
-            with config_path.open("rb") as f:
-                data = tomllib.load(f)
-        else:
-            data = {}
-        if "threads" not in data:
-            data["threads"] = {}
-        data["threads"]["scope"] = scope
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            # Clean up temp file on any failure, including interrupts.
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+        with _config_write_lock:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_path.exists():
+                with config_path.open("rb") as f:
+                    data = tomllib.load(f)
+            else:
+                data = {}
+            if "threads" not in data:
+                data["threads"] = {}
+            data["threads"]["scope"] = scope
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                # Clean up temp file on any failure, including interrupts.
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
         # `TypeError`/`ValueError` cover `tomli_w.dump` rejecting a payload
         # from a pre-existing config that does not round-trip; folding them in
@@ -3505,28 +5026,29 @@ def clear_default_agent(config_path: Path | None = None) -> bool:
     if config_path is None:
         config_path = DEFAULT_CONFIG_PATH
 
-    if not config_path.exists():
-        return True
-
     try:
-        with config_path.open("rb") as f:
-            data = tomllib.load(f)
+        with _config_write_lock:
+            if not config_path.exists():
+                return True
 
-        agents_section = data.get("agents")
-        if not isinstance(agents_section, dict) or "default" not in agents_section:
-            return True
+            with config_path.open("rb") as f:
+                data = tomllib.load(f)
 
-        del agents_section["default"]
+            agents_section = data.get("agents")
+            if not isinstance(agents_section, dict) or "default" not in agents_section:
+                return True
 
-        fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                tomli_w.dump(data, f)
-            Path(tmp_path).replace(config_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                Path(tmp_path).unlink()
-            raise
+            del agents_section["default"]
+
+            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
         # See `_save_toml_field` for why `TypeError` / `ValueError` are
         # folded into the bool return contract.

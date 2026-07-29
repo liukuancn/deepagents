@@ -18,12 +18,12 @@ if TYPE_CHECKING:
 
 from deepagents_code._env_vars import SERVER_ENV_PREFIX
 from deepagents_code._server_config import ServerConfig
-from deepagents_code.main import _resolve_rubric_text
-from deepagents_code.non_interactive import (
+from deepagents_code.client.non_interactive import (
     StreamState,
     _build_non_interactive_header,
     _process_rubric_event,
 )
+from deepagents_code.main import _resolve_rubric_text
 
 
 class TestResolveRubricText:
@@ -198,7 +198,7 @@ class TestServerConfigRubric:
     def test_defaults(self) -> None:
         config = ServerConfig()
         assert config.rubric_model is None
-        assert config.rubric_max_iterations == 3
+        assert config.rubric_max_iterations is None
 
     def test_round_trip(self) -> None:
         original = ServerConfig(
@@ -256,8 +256,8 @@ class TestHeaderIndicator:
         assert "Goal" not in header.plain
 
 
-def _render_event(data: dict) -> str:
-    state = StreamState()
+def _render_event(data: dict, *, show_rubric_iterations: bool = False) -> str:
+    state = StreamState(show_rubric_iterations=show_rubric_iterations)
     buf = io.StringIO()
     console = Console(file=buf, width=200, highlight=False)
     _process_rubric_event(data, state, console)
@@ -270,14 +270,22 @@ class TestProcessRubricEvent:
 
     def test_start_event(self) -> None:
         out = _render_event({"type": "rubric_evaluation_start", "iteration": 0})
-        assert "Grading against rubric" in out
+        assert "Checking acceptance criteria" in out
+        assert "iteration 1" not in out
+
+    def test_start_event_mentions_explicit_iteration(self) -> None:
+        out = _render_event(
+            {"type": "rubric_evaluation_start", "iteration": 0},
+            show_rubric_iterations=True,
+        )
+        assert "Checking acceptance criteria" in out
         assert "iteration 1" in out
 
     def test_satisfied(self) -> None:
         out = _render_event(
             {"type": "rubric_evaluation_end", "result": "satisfied", "criteria": []}
         )
-        assert "Rubric satisfied" in out
+        assert "Acceptance criteria satisfied" in out
 
     def test_needs_revision_with_criteria(self) -> None:
         out = _render_event(
@@ -291,7 +299,7 @@ class TestProcessRubricEvent:
                 ],
             }
         )
-        assert "needs revision" in out
+        assert "Acceptance criteria not yet satisfied" in out
         assert "tests missing" in out
         assert "no coverage" in out
         assert "style" not in out
@@ -300,7 +308,7 @@ class TestProcessRubricEvent:
         out = _render_event(
             {"type": "rubric_evaluation_end", "result": "max_iterations_reached"}
         )
-        assert "max iterations reached" in out
+        assert "Acceptance criteria not yet satisfied (iteration limit reached)" in out
 
     def test_failed(self) -> None:
         out = _render_event(
@@ -310,7 +318,7 @@ class TestProcessRubricEvent:
                 "explanation": "bad rubric",
             }
         )
-        assert "grader failed" in out
+        assert "Rubric is invalid or cannot be evaluated" in out
         assert "bad rubric" in out
 
     def test_grader_error(self) -> None:
@@ -323,7 +331,7 @@ class TestProcessRubricEvent:
                 "explanation": "provider 500",
             }
         )
-        assert "grader error" in out
+        assert "Acceptance criteria check failed" in out
         assert "provider 500" in out
 
     def test_unrecognized_terminal_result_surfaced(self) -> None:
@@ -336,7 +344,7 @@ class TestProcessRubricEvent:
                 "explanation": "details",
             }
         )
-        assert "Rubric grading ended" in out
+        assert "Acceptance criteria check ended" in out
         assert "details" in out
 
     def test_missing_result_prints_nothing(self) -> None:

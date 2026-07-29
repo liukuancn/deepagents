@@ -32,7 +32,7 @@ IMPORTANT: `Content` requires **Textual's** `Style` (`textual.style.Style`) for 
 
 ### `App.notify()` defaults to `markup=True`
 
-Textual's `App.notify(message)` parses the message string as Rich markup by default. Any dynamic content (exception messages, file paths, user input, command strings) containing brackets `[]`, ANSI escape codes, or `=` will cause a `MarkupError` crash in Textual's Toast renderer. Always pass `markup=False` when the message contains f-string interpolated variables. Hardcoded string literals are safe with the default.
+Textual's `App.notify(message)` parses the message string as Rich markup by default. Any dynamic content (exception messages, file paths, user input, command strings) containing square brackets is unsafe: tag-shaped text like `[bold]` is silently swallowed, and closing-tag-shaped text like `[/tmp/x]` raises a `MarkupError` crash in Textual's Toast renderer. Always pass `markup=False` when the message contains f-string interpolated variables. Hardcoded string literals are safe with the default.
 
 ### Rich `console.print()` and number highlighting
 
@@ -43,13 +43,26 @@ Textual's `App.notify(message)` parses the message string as Rich markup by defa
 Charset-dependent characters and animations have **single sources of truth**. Reuse them instead of hand-rolling new ones — copies drift, and (more subtly) a hardcoded Unicode literal won't degrade to ASCII on terminals that need it.
 
 - **Glyphs** (checkmarks, arrows, ellipsis, cursor, box-drawing, branch icon, etc.): pull from `get_glyphs()` (`config.Glyphs`). Each glyph has a Unicode and an ASCII variant; `get_glyphs()` returns the right set for the active terminal. Never inline `"✓"`, `"…"`, `"›"`, and friends.
-- **Animated spinners**: reuse the `Spinner` class in `widgets/loading.py`, which wraps `get_glyphs().spinner_frames` (braille on Unicode, `(-) (\) (|) (/)` on ASCII) and exposes `next_frame()`/`current_frame()`. Do **not** define your own frame tuples or interval constants for a spinner — drive a `Spinner` on a `set_interval`. The status-bar reconnect indicator (`widgets/status.py`) is the reference example; it ticks at the same 0.1s cadence as `LoadingWidget`. All connection/queue progress lives in the status bar — the welcome banner deliberately stays out of it, so there are currently no bespoke spinners to carve an exception for.
+- **Animated spinners**: reuse the `Spinner` class in `tui/widgets/loading.py`, which wraps `get_glyphs().spinner_frames` (braille on Unicode, `(-) (\) (|) (/)` on ASCII) and exposes `next_frame()`/`current_frame()`. Do **not** define your own frame tuples or interval constants for a spinner — drive a `Spinner` on a `set_interval`. The status-bar reconnect indicator (`tui/widgets/status.py`) is the reference example; it ticks at the same 0.1s cadence as `LoadingWidget`. All connection/queue progress lives in the status bar — the welcome banner deliberately stays out of it, so there are currently no bespoke spinners to carve an exception for.
 
 ### Textual patterns used in this codebase
 
 - **Workers** (`@work` decorator) for async operations - see [Workers guide](https://textual.textualize.io/guide/workers/)
 - **Message passing** for widget communication - see [Events guide](https://textual.textualize.io/guide/events/)
 - **Reactive attributes** for state management - see [Reactivity guide](https://textual.textualize.io/guide/reactivity/)
+
+### UI component organization
+
+Apply these rules to new UI; do not treat them as a mandate to refactor existing code.
+
+- Put root abstractions under `tui/screens/` and `tui/modals/`, and reusable components under `tui/widgets/`.
+- Give a large component its own `snake_case/` directory. Export its PascalCase root class from `__init__.py` (prefer implementing it there); give large subcomponents nested directories with the same pattern, while small subcomponents stay as sibling modules.
+- Keep single-use constants, helpers, business logic, and UI logic beside the component that owns them. If a helper gains a second caller, consider hoisting it to their nearest shared directory; by the third caller, extract it to a shared utility module.
+- Keep components focused; UI component modules should rarely exceed 200 lines.
+- Co-locate a screen's `.tcss` file with its root component and set `CSS_PATH` relative to that module. Its styles may target sibling and small nested components, but a large nested component should generally own its own stylesheet.
+- Widgets cannot use `CSS_PATH`; put intrinsic, auto-scoped defaults in `DEFAULT_CSS`. The mounting screen owns the widget's sizing and placement.
+- Children must not import parent components. They may import shared utilities and data models; send events up and pass state/data down.
+- A `ModalScreen` root inherits Textual's default translucent backdrop (`background: $background 60%`, which degrades to transparent under ansi themes) so it dims and composites the content underneath. Don't override it with `background: transparent` unless the modal is deliberately a non-dimming popover (as some selector overlays are); doing so by accident removes the dim.
 
 ### Testing Textual apps
 
@@ -66,6 +79,17 @@ When fixing `ty` diagnostics, do not mechanically replace `# type: ignore[...]` 
 For Textual tests that intentionally replace concrete app methods with `MagicMock` or `AsyncMock`, prefer `monkeypatch.setattr(...)` or one small documented dynamic helper over repeated `cast("Any", app)` expressions. Assert on local mock variables instead of re-reading mocked methods from the concrete object when possible.
 
 Casts are acceptable when the type violation is the point of the test (for example, passing a wrong runtime type to exercise defensive validation) or when a third-party overload is narrower than verified runtime behavior. In those cases, keep the cast narrowly scoped and add a short comment explaining why it is intentional.
+
+## Input surface nomenclature
+
+The REPL has **many** text-entry surfaces, so "the input" / "the input box" is ambiguous. Use these precise terms in code, comments, commit messages, and when talking to an agent. Each maps to a concrete class so there is a single, greppable referent.
+
+- **Chat input** (a.k.a. the composer): the primary prompt field at the bottom of the REPL where the user types messages to the agent. The widget is `ChatInput` (`tui/widgets/chat_input.py`), a container whose bordered box has id `#input-box`. Its editable field is the `ChatTextArea` with id `#chat-input`. When an unqualified "the input box" is used, it means **this** — but prefer "chat input" to stay unambiguous.
+- **Inline prompt**: a multi-line `TextArea` rendered inline in the message flow (not the chat input, not inside a modal). Base class `InlinePromptTextArea` (`tui/widgets/_inline_prompt.py`), subclassed by `AskUserTextArea` (free-text answers to agent `ask_user` questions, `ask_user.py`) and `GoalReviewTextArea` (editing goal text, `goal_review.py`).
+- **Modal field**: a single-line Textual `Input` inside a modal screen. Refer to it by its owner, e.g. the *auth key field* (`auth.py`), *MCP login field* (`#ml-input`, `mcp_login.py`), or the *rejection reason field* (`approval.py`).
+- **Filter input**: the single-line `Input` that filters an `OptionList`/`Select` in a picker — the *model-selector filter* (`model_selector.py`), *thread-selector filter* (`thread_selector.py`), and *MCP viewer filter* (`#mcp-filter`, `mcp_viewer.py`). A specialized modal field; call it a "filter input" when the point is filtering.
+
+Rule of thumb: say **chat input** for the main composer and name any other surface by its owner (`<owner> field` / `<owner> filter`). Reserve bare "input box" for the chat input only.
 
 ## SDK dependency pin
 
@@ -91,7 +115,8 @@ Debug logging is configured **once**, on the `deepagents_code` package logger, b
 
 - Do **not** add per-module `configure_debug_logging(logger)` calls. They are redundant now that the package logger is configured at import, and they reintroduce the duplicate-handler problem the single-config approach solves.
 - Every module should create its logger with `logging.getLogger(__name__)` so it stays inside the `deepagents_code.*` hierarchy and inherits the package handler. Don't set `logger.propagate = False` or attach your own handlers.
-- The handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; the no-op path is a single env-var read, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` env vars.
+- The **file** handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; that path is a single env-var read, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` / `DEEPAGENTS_CODE_LOG_LEVEL` env vars.
+- Separately, an **always-on in-memory ring buffer** (`_debug_buffer.install_log_buffer`, called from `__init__.py` right before `configure_debug_logging`) attaches unconditionally at import so the in-app Debug Console (`Ctrl+\`) can tail recent `deepagents_code.*` records without file logging. It captures `INFO` and above by default (or `DEEPAGENTS_CODE_LOG_LEVEL`), and may lower the package logger to `INFO` for the process lifetime. It never spills to the terminal (a handler is always found, so `lastResort` is skipped) and is bounded (a `deque` of 1000 records *per log level*), so it's cheap enough to keep on. Because it installs *before* `configure_debug_logging`, warnings that helper emits at startup are captured and visible in the console.
 
 ## CLI help screen
 
@@ -99,7 +124,7 @@ The `deepagents-code --help` screen is hand-maintained in `ui.show_help()`, sepa
 
 ## Splash screen tips
 
-When adding a user-facing CLI feature (new slash command, keybinding, workflow), add a corresponding tip to the `_TIPS` list in `deepagents_code/widgets/welcome.py`. Tips are shown randomly on startup to help users discover features. Keep tips short and action-oriented (e.g., `"Press ctrl+x to compose prompts in your external editor"`).
+When adding a user-facing CLI feature (new slash command, keybinding, workflow), add a corresponding entry to the `_TIPS` dict in `deepagents_code/tui/widgets/startup_tip.py`, mapping the tip text to a relative selection weight (higher = shown more often). One tip is chosen at random above the input on startup to help users discover features. Keep tips short and action-oriented (e.g., `"Press ctrl+x to compose prompts in your external editor"`).
 
 ## Slash commands
 
@@ -115,7 +140,7 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 2. `deepagents_code/model_config.py` — if the provider reads a *dedicated* endpoint env var, add `"provider_name": ("CANONICAL_BASE_URL", "ALTERNATE", ...)` to `PROVIDER_BASE_URL_ENV` (see guidelines below); omit the provider entirely when it has no provider-specific endpoint variable
 3. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
 4. `deepagents_code/model_config.py` — add `"provider_name"` to `RETRY_PARAM_BY_PROVIDER` if the provider's chat model accepts `max_retries`
-5. `deepagents_code/widgets/auth.py` — add `"provider_name": "Display Name"` to `PROVIDER_DISPLAY_NAMES` so the `/auth` UI shows a branded label instead of the title-cased key, and (if the provider issues API keys from a self-serve page) `"provider_name": "https://…"` to `PROVIDER_API_KEY_URLS` so the prompt links straight to the key page
+5. `deepagents_code/tui/widgets/auth.py` — add `"provider_name": "Display Name"` to `PROVIDER_DISPLAY_NAMES` so the `/auth` UI shows a branded label instead of the title-cased key, and (if the provider issues API keys from a self-serve page) `"provider_name": "https://…"` to `PROVIDER_API_KEY_URLS` so the prompt links straight to the key page
 6. `tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`, and pin any `PROVIDER_BASE_URL_ENV` entry with a matching assertion
 
 ### `PROVIDER_BASE_URL_ENV` guidelines
